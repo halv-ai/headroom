@@ -1,0 +1,7 @@
+# Local build / test artifacts for the frozen sidecar.
+.venv/
+dist/
+build/
+.smoke-cache/
+*.spec.bak
+__pycache__/

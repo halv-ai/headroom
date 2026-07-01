@@ -1,0 +1,83 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "23 4 * * 1" # Mondays 04:23 UTC (off the :00 rush)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: https://github.com/headroomlabs-ai/headroom
+      SYNC_BRANCH: upstream-sync
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: delta
+        run: |
+          count=$(git rev-list --count origin/main..upstream/main)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Upstream is $count commit(s) ahead of origin/main."
+
+      - name: Merge upstream into sync branch
+        if: steps.delta.outputs.count != '0'
+        id: merge
+        run: |
+          git checkout -B "$SYNC_BRANCH" origin/main
+          if git merge --no-edit upstream/main; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            # Leave conflict resolution to a human: ship upstream/main as the
+            # branch head so the PR shows the conflicts against main.
+            git merge --abort
+            git reset --hard upstream/main
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+          fi
+          git push --force origin "$SYNC_BRANCH"
+
+      - name: Open (or reuse) pull request
+        if: steps.delta.outputs.count != '0'
+        run: |
+          existing=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number --jq 'length')
+          if [ "$existing" != "0" ]; then
+            echo "Open PR from $SYNC_BRANCH already exists; branch was updated."
+            exit 0
+          fi
+          if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
+            title="chore: sync upstream headroom (CONFLICTS — resolve manually)"
+            body="Automated weekly sync from \`headroomlabs-ai/headroom@main\`.
+
+          The automatic merge hit conflicts, so this branch carries upstream/main
+          as-is. Resolve conflicts against \`main\` before merging."
+          else
+            title="chore: sync upstream headroom"
+            body="Automated weekly sync from \`headroomlabs-ai/headroom@main\`. Clean merge into \`main\`."
+          fi
+          gh pr create \
+            --base main \
+            --head "$SYNC_BRANCH" \
+            --title "$title" \
+            --body "$body"
