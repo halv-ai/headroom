@@ -66,8 +66,33 @@ def cmd_setup() -> int:
     return 0
 
 
+def _watch_parent() -> None:
+    """Exit when the supervising desktop app dies, whatever the cause.
+
+    Children are not killed on parent death on Unix; if the app is
+    SIGKILLed (or any quit path misses its shutdown hook) the proxy would
+    linger forever. Reparenting to pid 1 is the death signal.
+    """
+    import threading
+    import time
+
+    initial = os.getppid()
+
+    def loop() -> None:
+        while True:
+            p = os.getppid()
+            if p != initial or p == 1:
+                os._exit(0)
+            time.sleep(2.0)
+
+    threading.Thread(target=loop, daemon=True, name="parent-watchdog").start()
+
+
 def cmd_proxy(argv: list[str]) -> int:
     from headroom.cli import main as headroom_main
+
+    if os.environ.get("HEADROOM_DESKTOP_SUPERVISED") == "1":
+        _watch_parent()
 
     sys.argv = ["headroom", "proxy", *argv]
     try:
