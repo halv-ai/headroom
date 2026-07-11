@@ -2289,6 +2289,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "compress_user_messages": bool(
                     profile_kwargs.get("compress_user_messages", config.compress_user_messages)
                 ),
+                "compress_responses_messages": config.compress_responses_messages,
                 "compress_system_messages": bool(
                     profile_kwargs.get(
                         "compress_system_messages",
@@ -3293,6 +3294,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "compress_user_messages": bool(
                 profile_kwargs.get("compress_user_messages", config.compress_user_messages)
             ),
+            "compress_responses_messages": config.compress_responses_messages,
             "compress_system_messages": bool(
                 profile_kwargs.get("compress_system_messages", config.compress_system_messages)
             ),
@@ -4080,6 +4082,8 @@ def _proxy_config_from_env() -> ProxyConfig:
         disable_kompress_anthropic=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC"),
         disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
         force_kompress_all=_get_env_bool("HEADROOM_FORCE_KOMPRESS_ALL", False),
+        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        compress_responses_messages=_get_env_bool("HEADROOM_COMPRESS_RESPONSES_MESSAGES", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
@@ -4512,6 +4516,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--compress-responses-messages",
+        action="store_true",
+        help=(
+            "Opt in to compressing older OpenAI Responses `message` items. "
+            "Default is off for prefix-cache safety. Also settable via "
+            "HEADROOM_COMPRESS_RESPONSES_MESSAGES=1."
+        ),
+    )
+    parser.add_argument(
         "--disable-kompress",
         action="store_true",
         help=(
@@ -4729,6 +4742,8 @@ if __name__ == "__main__":
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        compress_responses_messages=args.compress_responses_messages
+        or _get_env_bool("HEADROOM_COMPRESS_RESPONSES_MESSAGES", False),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
         # Default 0.4 keep-ratio so the Kompress text (prose/code) path compresses
         # meaningfully out of the box; HEADROOM_TARGET_RATIO overrides.

@@ -60,7 +60,7 @@ from headroom.proxy.project_context import classify_project, set_current_project
 logger = logging.getLogger("headroom.proxy")
 
 _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES = 10_000
-_OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v1"
+_OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v3"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_ENV = "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
 _OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
@@ -74,6 +74,8 @@ _OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
 _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
+_HEADROOM_COMPRESS_MESSAGES_HEADER = "x-headroom-compress-messages"
+_RESPONSES_MESSAGE_CONTENT_TEXT_TYPES = frozenset({"input_text", "output_text", "text"})
 
 
 def _header_get(headers: dict[str, str], name: str) -> str | None:
@@ -519,6 +521,114 @@ def _responses_part_text(value: Any) -> str:
     return ""
 
 
+def _responses_accounting_text(value: Any) -> str:
+    """Return stable text for token-accounting-only Responses fields."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _responses_message_content_text(value: Any) -> str:
+    """Join only Responses message part types that carry prompt text."""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    return "\n".join(
+        part["text"]
+        for part in value
+        if isinstance(part, dict)
+        and part.get("type") in _RESPONSES_MESSAGE_CONTENT_TEXT_TYPES
+        and isinstance(part.get("text"), str)
+        and part["text"]
+    )
+
+
+def _responses_input_to_token_messages(
+    instructions: Any,
+    input_data: Any,
+) -> list[dict[str, Any]]:
+    """Convert Responses input into synthetic messages for fallback counting.
+
+    This stays separate from the handler's legacy ``messages`` list because that
+    list also controls memory queries, session ids, turn ids, and optional prompt
+    logging. Accounting must see every text-bearing Responses input item without
+    changing those unrelated behaviors.
+    """
+    messages: list[dict[str, Any]] = []
+    if isinstance(instructions, str) and instructions:
+        messages.append({"role": "system", "content": instructions})
+    if isinstance(input_data, str):
+        if input_data:
+            messages.append({"role": "user", "content": input_data})
+        return messages
+    if not isinstance(input_data, list):
+        return messages
+
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "message" or ("role" in item and "content" in item):
+            text = _responses_message_content_text(item.get("content"))
+            if text:
+                role = item.get("role")
+                messages.append(
+                    {"role": role if isinstance(role, str) and role else "user", "content": text}
+                )
+            continue
+
+        # Counting is intentionally broader than compression eligibility:
+        # future/unknown tool output item types still contribute prompt tokens,
+        # while the mutation path remains restricted to its explicit allowlist.
+        if "output" in item:
+            output = _responses_accounting_text(item.get("output"))
+            if output:
+                message: dict[str, Any] = {"role": "tool", "content": output}
+                call_id = item.get("call_id")
+                if isinstance(call_id, str) and call_id:
+                    message["tool_call_id"] = call_id
+                messages.append(message)
+            continue
+
+        arguments = _responses_accounting_text(item.get("arguments"))
+        if arguments:
+            function: dict[str, str] = {"arguments": arguments}
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                function["name"] = name
+            tool_call: dict[str, Any] = {"type": "function", "function": function}
+            call_id = item.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                tool_call["id"] = call_id
+            messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
+
+    return messages
+
+
+def _count_openai_responses_payload_tokens(tokenizer: Any, payload: dict[str, Any]) -> int:
+    """Best-effort fallback count of the prompt-bearing Responses payload."""
+    messages = _responses_input_to_token_messages(
+        payload.get("instructions"),
+        payload.get("input"),
+    )
+    total = int(tokenizer.count_messages(messages))
+
+    # Tool definitions are prompt bytes too, and this path can compact them.
+    # Including their canonical JSON keeps before/after accounting consistent
+    # with both message/tool-output compression and tool-schema compaction.
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools:
+        total += int(tokenizer.count_text(_responses_accounting_text(tools)))
+    return max(total, 0)
+
+
 def _responses_input_to_waste_messages(instructions: Any, input_data: Any) -> list[dict[str, Any]]:
     """Convert a Responses payload to OpenAI-style messages for waste parsing (#820).
 
@@ -744,6 +854,18 @@ def _prefers_http1_passthrough(base_url: str) -> bool:
     return host == "chatgpt.com" or host.endswith(".chatgpt.com")
 
 
+def _headroom_compress_messages_enabled(headers: Any) -> bool:
+    """Return True when inbound headers opt a request into message compression."""
+
+    try:
+        for key, value in headers.items():
+            if str(key).lower() == _HEADROOM_COMPRESS_MESSAGES_HEADER:
+                return str(value).strip().lower() == "true"
+    except (AttributeError, TypeError):
+        return False
+    return False
+
+
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
@@ -778,6 +900,129 @@ class OpenAIHandlerMixin:
             cache.move_to_end(key)
             while len(cache) > _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES:
                 cache.popitem(last=False)
+
+    def _compress_openai_responses_message_unit(
+        self,
+        unit: Any,
+        *,
+        tokenizer: Any,
+        target_ratio: float | None,
+    ) -> Any:
+        """Compress a cache-prefix message with the deterministic TextCrusher."""
+        from headroom.transforms.compression_units import UnitCompressionResult
+        from headroom.transforms.content_router import (
+            CompressionStrategy,
+            RouterCompressionResult,
+        )
+
+        tokens_before = int(tokenizer.count_text(unit.text))
+        text_bytes = len(unit.text.encode("utf-8", errors="replace"))
+
+        def _unchanged(
+            reason: str,
+            reason_category: str,
+            *,
+            router_result: RouterCompressionResult | None = None,
+            compressed: str | None = None,
+            tokens_after: int | None = None,
+        ) -> UnitCompressionResult:
+            return UnitCompressionResult(
+                original=unit.text,
+                compressed=unit.text if compressed is None else compressed,
+                modified=False,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before if tokens_after is None else tokens_after,
+                tokens_saved=0,
+                transforms_applied=[],
+                strategy="text_crusher",
+                reason=reason,
+                router_result=router_result,
+                text_bytes=text_bytes,
+                min_bytes=unit.min_bytes,
+                reason_category=reason_category,
+            )
+
+        # Defense in depth: extraction applies the same role gates before this
+        # method is called, but the compressor must remain safe if reused directly.
+        if not unit.mutable:
+            return _unchanged("immutable", "immutable")
+        if unit.role == "user" and unit.metadata.get("compress_user") != "true":
+            return _unchanged("protected_user_message", "protected_role")
+        if unit.role in {"system", "developer"}:
+            return _unchanged("protected_system_message", "protected_role")
+        if unit.role == "assistant" and unit.metadata.get("compress_assistant") != "true":
+            return _unchanged("protected_assistant_message", "protected_role")
+        if unit.cache_zone != "live":
+            return _unchanged(f"cache_zone_{unit.cache_zone}", "cache_zone")
+        if len(unit.text) < unit.min_bytes:
+            return _unchanged("below_unit_floor", "size_floor")
+
+        with _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK:
+            compressor = getattr(self, "_openai_responses_message_text_crusher", None)
+            if compressor is None:
+                try:
+                    from headroom.transforms.text_crusher import TextCrusher
+
+                    compressor = TextCrusher()
+                except Exception as exc:
+                    logger.debug("Responses message TextCrusher unavailable: %s", exc)
+                    compressor = False
+                self._openai_responses_message_text_crusher = compressor
+        if compressor is False:
+            return _unchanged("message_compressor_unavailable", "compressor_noop")
+
+        try:
+            compressed_result = compressor.compress(
+                unit.text,
+                context=unit.context,
+                target_ratio=target_ratio,
+            )
+            replacement = compressed_result.compressed
+        except Exception as exc:
+            logger.debug("Responses message TextCrusher failed: %s", exc)
+            return _unchanged("message_compressor_failed", "compressor_noop")
+
+        router_result = RouterCompressionResult(
+            compressed=replacement,
+            original=unit.text,
+            strategy_used=CompressionStrategy.TEXT,
+            strategy_chain=["text_crusher"],
+        )
+        if replacement == unit.text:
+            return _unchanged(
+                "router_no_change",
+                "compressor_noop",
+                router_result=router_result,
+            )
+
+        tokens_after = int(tokenizer.count_text(replacement))
+        if tokens_after >= tokens_before:
+            return _unchanged(
+                "rejected_not_smaller",
+                "rejected_not_smaller",
+                router_result=router_result,
+                compressed=replacement,
+                tokens_after=tokens_after,
+            )
+
+        return UnitCompressionResult(
+            original=unit.text,
+            compressed=replacement,
+            modified=True,
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            tokens_saved=tokens_before - tokens_after,
+            transforms_applied=[
+                "router:openai:responses:message:text_crusher",
+                "text_crusher",
+            ],
+            strategy="text_crusher",
+            reason=None,
+            router_result=router_result,
+            text_bytes=text_bytes,
+            min_bytes=unit.min_bytes,
+            reason_category="applied",
+        )
 
     @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
@@ -829,6 +1074,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         pass_id: str | None = None,
         timing: dict[str, float] | None = None,
+        compress_responses_messages: bool = False,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -877,6 +1123,33 @@ class OpenAIHandlerMixin:
             logger.debug("[%s] OpenAI Responses ContentRouter unavailable", request_id)
             return payload, False, 0, [], {}, [], 0
         profile_kwargs = proxy_pipeline_kwargs(getattr(self, "config", None))
+        effective_compress_responses_messages = bool(
+            compress_responses_messages
+            or getattr(getattr(self, "config", None), "compress_responses_messages", False)
+        )
+        # The per-request argument is the inbound header's provenance, not the
+        # merged effective setting. An explicit client opt-in grants user-message
+        # compression; the global config keeps its independent user-role gate.
+        compress_user_messages_enabled = bool(
+            compress_responses_messages or profile_kwargs.get("compress_user_messages") is True
+        )
+        protect_recent_raw = profile_kwargs.get("protect_recent")
+        try:
+            message_protect_recent = (
+                max(0, int(protect_recent_raw)) if protect_recent_raw is not None else 6
+            )
+        except (TypeError, ValueError):
+            message_protect_recent = 6
+        message_indices = [
+            idx
+            for idx, item in enumerate(items)
+            if isinstance(item, dict) and item.get("type") == "message"
+        ]
+        protected_message_indices = (
+            set(message_indices[-message_protect_recent:])
+            if effective_compress_responses_messages and message_protect_recent > 0
+            else set()
+        )
         unit_target_ratio = profile_kwargs.get("target_ratio")
         if unit_target_ratio is not None:
             unit_target_ratio = float(unit_target_ratio)
@@ -892,11 +1165,6 @@ class OpenAIHandlerMixin:
             return payload, False, 0, [], {}, [], 0
 
         def _slot_text(item: dict[str, Any]) -> tuple[str, tuple[str, int | None]] | None:
-            # Only tool-output items are eligible for in-place compression.
-            # Message items (user/system/assistant) sit inside the request's
-            # cacheable prefix; mutating them busts prefix caching on every
-            # subsequent turn. Role-level guards in compression_units.py
-            # remain as defense-in-depth.
             type_tag = item.get("type")
             if type_tag in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 output = item.get("output")
@@ -904,14 +1172,37 @@ class OpenAIHandlerMixin:
                     return output, ("output", None)
             return None
 
+        def _message_content_text_slots(
+            item: dict[str, Any],
+        ) -> list[tuple[str, tuple[str, int | None]]]:
+            content = item.get("content")
+            if not isinstance(content, list):
+                return []
+            slots: list[tuple[str, tuple[str, int | None]]] = []
+            for part_idx, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") not in _RESPONSES_MESSAGE_CONTENT_TEXT_TYPES:
+                    continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    slots.append((text, ("content", part_idx)))
+            return slots
+
         def _set_slot_text(
             item: dict[str, Any],
             slot: tuple[str, int | None],
             replacement: str,
         ) -> None:
-            kind, _ = slot
+            kind, index = slot
             if kind == "output":
                 item["output"] = replacement
+            elif kind == "content" and isinstance(index, int):
+                content = item.get("content")
+                if isinstance(content, list) and index < len(content):
+                    part = content[index]
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        part["text"] = replacement
 
         headroom_retrieve_call_ids: set[str] = set()
         # Map each Responses tool call to its name so that outputs belonging to
@@ -960,7 +1251,7 @@ class OpenAIHandlerMixin:
             )
 
         extraction_started = time.perf_counter()
-        candidates: list[tuple[int, tuple[str, int | None], str]] = []
+        candidates: list[tuple[int, tuple[str, int | None], str, str, str, dict[str, str]]] = []
         extraction_debug: list[dict[str, Any]] = []
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
@@ -1008,7 +1299,7 @@ class OpenAIHandlerMixin:
                 slot = _slot_text(item)
                 if slot is not None:
                     text, slot_ref = slot
-                    candidates.append((idx, slot_ref, text))
+                    candidates.append((idx, slot_ref, text, "tool", str(item_type), {}))
                     if debug_enabled:
                         extraction_debug.append(
                             {
@@ -1032,6 +1323,99 @@ class OpenAIHandlerMixin:
                                 "eligible": False,
                                 "reason": "output_type_without_text_slot",
                                 "item_type": item_type,
+                                "item": item,
+                            }
+                        )
+            elif effective_compress_responses_messages and item_type == "message":
+                if idx in protected_message_indices:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "recent_message_protected",
+                                "protect_recent": message_protect_recent,
+                                "item_type": item_type,
+                                "role": item.get("role"),
+                                "item": item,
+                            }
+                        )
+                    continue
+                raw_role = item.get("role")
+                role = raw_role if isinstance(raw_role, str) else ""
+                metadata: dict[str, str] = {"original_role": role or "unknown"}
+                if role == "assistant":
+                    metadata["compress_assistant"] = "true"
+                elif role == "user" and compress_user_messages_enabled:
+                    metadata["compress_user"] = "true"
+                elif role == "user":
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "user_message_compression_disabled",
+                                "item_type": item_type,
+                                "role": role,
+                                "item": item,
+                            }
+                        )
+                    continue
+                elif role in {"system", "developer"}:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "protected_message_role",
+                                "item_type": item_type,
+                                "role": role,
+                                "item": item,
+                            }
+                        )
+                    continue
+                else:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "unsupported_message_role",
+                                "item_type": item_type,
+                                "role": role,
+                                "item": item,
+                            }
+                        )
+                    continue
+
+                slots = _message_content_text_slots(item)
+                if slots:
+                    for text, slot_ref in slots:
+                        candidates.append((idx, slot_ref, text, role, "message", dict(metadata)))
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": True,
+                                    "item_type": item_type,
+                                    "role": role,
+                                    "slot": slot_ref,
+                                    "text_chars": len(text),
+                                    "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                    "text_json_shape": _json_shape(text),
+                                    "item": item,
+                                    "text": text,
+                                }
+                            )
+                else:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "message_without_text_slot",
+                                "item_type": item_type,
+                                "role": role,
                                 "item": item,
                             }
                         )
@@ -1084,10 +1468,10 @@ class OpenAIHandlerMixin:
         # `attempted_input_tokens` is the *compressible* portion of the
         # request — only the tokens we actually fed to the router (i.e.
         # extracted units that passed the floor + role + cache_zone
-        # gates). It excludes user messages, system prompts, prior-turn
-        # assistant content, and other frozen prefix bytes. This is the
-        # right denominator for the dashboard savings ratio: comparing
-        # tokens_saved against tokens we ATTEMPTED to compress, not
+        # gates). It excludes anything we did not expose as an eligible unit
+        # (for example protected recent messages and system/developer roles).
+        # This is the right denominator for the dashboard savings ratio:
+        # comparing tokens_saved against tokens we ATTEMPTED to compress, not
         # against everything in the request.
         attempted_input_tokens = 0
         transforms: list[str] = []
@@ -1095,10 +1479,14 @@ class OpenAIHandlerMixin:
 
         unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
-        for item_idx, slot_ref, original_text in candidates:
-            item = items[item_idx] if item_idx < len(items) else {}
-            item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
-            role = str(item.get("role") or "tool") if isinstance(item, dict) else "tool"
+        for item_idx, slot_ref, original_text, role, item_type, metadata in candidates:
+            # Prefix-cache contract: Responses message bytes must be reproducible
+            # after cache eviction and process restart, not merely while the unit
+            # LRU is warm. Message units therefore use only TextCrusher, whose
+            # extractive scoring and index tie-breaks are byte-deterministic.
+            # ContentRouter remains the tool-output path; its Kompress candidate
+            # is excluded here because readiness, semaphore saturation, and its
+            # wall-clock deadline can change output for identical input.
             unit = CompressionUnit(
                 text=original_text,
                 provider="openai",
@@ -1108,6 +1496,7 @@ class OpenAIHandlerMixin:
                 cache_zone="live",
                 mutable=True,
                 min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                metadata=metadata,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -1150,12 +1539,19 @@ class OpenAIHandlerMixin:
             # `elapsed_ms=60000+` in production logs even though they did
             # no work. With the semaphore deleted, this timer is honest.
             unit_started = time.perf_counter()
-            result = compress_unit_with_router(
-                routed.unit,
-                router=router,
-                tokenizer=tokenizer,
-                target_ratio=unit_target_ratio,
-            )
+            if routed.unit.item_type == "message":
+                result = self._compress_openai_responses_message_unit(
+                    routed.unit,
+                    tokenizer=tokenizer,
+                    target_ratio=unit_target_ratio,
+                )
+            else:
+                result = compress_unit_with_router(
+                    routed.unit,
+                    router=router,
+                    tokenizer=tokenizer,
+                    target_ratio=unit_target_ratio,
+                )
             elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
             return routed.slot, result, elapsed_ms
 
@@ -1361,6 +1757,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timing: dict[str, float] | None = None,
+        compress_responses_messages: bool = False,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -1461,6 +1858,7 @@ class OpenAIHandlerMixin:
             request_id=request_id,
             pass_id=pass_id,
             timing=timing_sink,
+            compress_responses_messages=compress_responses_messages,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -1475,10 +1873,9 @@ class OpenAIHandlerMixin:
         # Total tokens we *attempted* to compress on this pass:
         # router-fed unit tokens + the original (pre-compaction) tool
         # schema tokens we ran schema_compaction against. Excludes
-        # instructions, user messages, prior assistant turns, and
-        # other prefix bytes we never tried to touch — those belong
-        # to the prefix-cache denominator, not the active-compression
-        # one.
+        # instructions, protected messages, and other prefix bytes we never
+        # tried to touch — those belong to the prefix-cache denominator, not
+        # the active-compression one.
         attempted_input_tokens = int(router_attempted_tokens)
         if tools_modified:
             try:
@@ -1581,6 +1978,7 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        compress_responses_messages: bool = False,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -1591,6 +1989,7 @@ class OpenAIHandlerMixin:
                     model=model,
                     request_id=request_id,
                     timing=timing,
+                    compress_responses_messages=compress_responses_messages,
                 )
             except TypeError as exc:
                 if "unexpected keyword argument 'timing'" not in str(exc):
@@ -1599,6 +1998,7 @@ class OpenAIHandlerMixin:
                     payload,
                     model=model,
                     request_id=request_id,
+                    compress_responses_messages=compress_responses_messages,
                 )
 
         result = await self._run_compression_in_executor(
@@ -3003,6 +3403,7 @@ class OpenAIHandlerMixin:
         stream = body.get("stream", False)
         body_mutation_tracker = BodyMutationTracker()
         _bypass = self._headroom_bypass_enabled(request.headers)
+        _compress_responses_messages = _headroom_compress_messages_enabled(request.headers)
         if _bypass:
             logger.info(
                 "[%s] Responses passthrough reason=bypass_header mutation=disabled",
@@ -3140,9 +3541,11 @@ class OpenAIHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
-        # Token counting on converted messages
+        # Fallback token counting must use the native Responses payload shape.
+        # The legacy `messages` list above intentionally remains scoped to
+        # memory/session behavior and omits array-form input.
         tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        original_tokens = _count_openai_responses_payload_tokens(tokenizer, body)
 
         # Defaults below feed downstream telemetry and memory injection.
         # If optimization remains enabled, the Responses payload is compressed
@@ -3359,6 +3762,13 @@ class OpenAIHandlerMixin:
             )
             url = _append_request_query(url, request.url.query)
 
+        # Memory injection happens before Responses compression. Rebase the
+        # fallback counter here against the payload the compressor received,
+        # not the earlier pre-injection body.
+        original_tokens = _count_openai_responses_payload_tokens(tokenizer, body)
+        optimized_tokens = original_tokens
+        compression_modified = False
+
         # The standalone Rust proxy has native /v1/responses item handling,
         # but the default CLI runtime is this Python proxy. Compress the
         # Python runtime path here by extracting mutable Responses text into
@@ -3381,12 +3791,22 @@ class OpenAIHandlerMixin:
                     body,
                     model=model,
                     request_id=request_id,
+                    compress_responses_messages=_compress_responses_messages,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _modified:
+                    compression_modified = True
                     body_mutation_tracker.mark_mutated("responses_compression")
-                    tokens_saved = int(_tokens_saved)
-                    optimized_tokens = max(0, original_tokens - tokens_saved)
+                    optimized_tokens = _count_openai_responses_payload_tokens(tokenizer, body)
+                    tokens_saved = max(0, original_tokens - optimized_tokens)
+                    if tokens_saved != int(_tokens_saved):
+                        logger.debug(
+                            "[%s] Responses compression token recount differed "
+                            "from unit sum (recount=%d unit_sum=%d)",
+                            request_id,
+                            tokens_saved,
+                            int(_tokens_saved),
+                        )
                     transforms_applied = [*_transforms, *list(transforms_applied)]
                     logger.info(
                         "[%s] /v1/responses compressed %d→%d bytes "
@@ -3454,6 +3874,41 @@ class OpenAIHandlerMixin:
                             }
                         },
                     ) from _e
+
+            try:
+                from headroom.proxy.output_shaper import (
+                    OutputShaperSettings,
+                    resolve_verbosity_level,
+                    shape_responses_request,
+                )
+
+                _shaper_settings = OutputShaperSettings.from_env()
+                if _shaper_settings.enabled:
+                    _level, _src = resolve_verbosity_level(_shaper_settings)
+                    shape_result = shape_responses_request(
+                        body,
+                        _shaper_settings,
+                        level_override=_level,
+                    )
+                    if shape_result.changed:
+                        body_mutation_tracker.mark_mutated("output_shaper")
+                        transforms_applied.extend(shape_result.labels or [])
+                        logger.info(
+                            "[%s] OutputShaper Responses(L%d/%s): %s",
+                            request_id,
+                            _level,
+                            _src,
+                            shape_result.labels,
+                        )
+            except Exception as _e:
+                logger.debug("[%s] OutputShaper Responses skipped: %s", request_id, _e)
+
+        # `optimized_tokens` is the fallback size of the body actually sent
+        # upstream, including any Responses output-shaper change. Compression
+        # savings are the net pre-compression vs. forwarded-payload reduction.
+        optimized_tokens = _count_openai_responses_payload_tokens(tokenizer, body)
+        if compression_modified:
+            tokens_saved = max(0, original_tokens - optimized_tokens)
 
         capture_codex_wire_debug(
             "http_upstream_request",
@@ -3553,7 +4008,8 @@ class OpenAIHandlerMixin:
                 )
                 total_latency = (time.time() - start_time) * 1000
 
-                total_input_tokens = original_tokens  # fallback
+                total_input_tokens = optimized_tokens  # fallback
+                input_tokens_reported = False
                 output_tokens = 0
                 cache_read_tokens = 0
                 try:
@@ -3566,10 +4022,15 @@ class OpenAIHandlerMixin:
                         except (TypeError, ValueError):
                             return default
 
-                    total_input_tokens = _usage_int(
-                        usage.get("input_tokens"),
-                        original_tokens,
-                    )
+                    raw_input_tokens = usage.get("input_tokens")
+                    if raw_input_tokens is not None:
+                        try:
+                            reported_input_tokens = max(int(raw_input_tokens), 0)
+                            if reported_input_tokens > 0:
+                                total_input_tokens = reported_input_tokens
+                                input_tokens_reported = True
+                        except (TypeError, ValueError):
+                            total_input_tokens = optimized_tokens
                     output_tokens = _usage_int(usage.get("output_tokens"))
                     details = usage.get("input_tokens_details")
                     if isinstance(details, dict):
@@ -3654,33 +4115,19 @@ class OpenAIHandlerMixin:
                             f"[{request_id}] Memory tool handling failed (responses): {e}"
                         )
 
-                if self.cost_tracker:
-                    cache_write_tokens = _infer_openai_cache_write_tokens(
-                        total_input_tokens,
-                        cache_read_tokens,
-                    )
-                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
-                    self.cost_tracker.record_tokens(
-                        model,
-                        tokens_saved,
-                        total_input_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        uncached_tokens=uncached_input_tokens,
-                    )
-                else:
-                    cache_write_tokens = _infer_openai_cache_write_tokens(
-                        total_input_tokens,
-                        cache_read_tokens,
-                    )
-                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
-
-                effective_optimized_tokens = (
-                    total_input_tokens if total_input_tokens > 0 else optimized_tokens
+                cache_write_tokens = _infer_openai_cache_write_tokens(
+                    total_input_tokens,
+                    cache_read_tokens,
                 )
-                effective_original_tokens = max(
-                    original_tokens,
-                    effective_optimized_tokens + tokens_saved,
+                uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+                # RequestOutcome is the single metrics/logger/cost funnel. A
+                # manual record here counted every Responses request twice.
+
+                effective_optimized_tokens = total_input_tokens
+                effective_original_tokens = (
+                    effective_optimized_tokens + tokens_saved
+                    if input_tokens_reported
+                    else original_tokens
                 )
 
                 _resp_log_tags = {
@@ -3795,6 +4242,7 @@ class OpenAIHandlerMixin:
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
+        _ws_compress_responses_messages = _headroom_compress_messages_enabled(ws_headers)
         _ws_url_obj = getattr(websocket, "url", None)
         _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
         _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
@@ -4641,6 +5089,7 @@ class OpenAIHandlerMixin:
                                 _inner,
                                 model=_model,
                                 request_id=request_id,
+                                compress_responses_messages=_ws_compress_responses_messages,
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -4925,6 +5374,7 @@ class OpenAIHandlerMixin:
                                     inner_payload,
                                     model=model_for_frame,
                                     request_id=request_id,
+                                    compress_responses_messages=_ws_compress_responses_messages,
                                 )
                                 for (
                                     _timing_name,

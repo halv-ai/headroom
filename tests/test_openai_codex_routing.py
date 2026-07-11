@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import sys
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,10 +12,14 @@ from fastapi import Request
 
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
+    _count_openai_responses_payload_tokens,
     _is_allowed_websocket_origin,
     _openai_responses_unit_cache_key,
     _resolve_codex_routing_headers,
+    _responses_input_to_token_messages,
 )
+from headroom.tokenizers import CharacterCounter, EstimatingTokenCounter
+from headroom.transforms.content_router import ContentRouter
 
 
 def _jwt(payload: dict) -> str:
@@ -135,8 +140,33 @@ def test_openai_responses_unit_cache_key_includes_target_ratio() -> None:
     assert aggressive_key != balanced_key
 
 
+def test_responses_message_env_config_keeps_user_gate_independent(monkeypatch) -> None:
+    from headroom.proxy.server import _proxy_config_from_env
+
+    monkeypatch.delenv("HEADROOM_PROXY_CONFIG_JSON", raising=False)
+    monkeypatch.setenv("HEADROOM_COMPRESS_RESPONSES_MESSAGES", "1")
+    monkeypatch.setenv("HEADROOM_COMPRESS_USER_MESSAGES", "1")
+
+    config = _proxy_config_from_env()
+
+    assert config.compress_responses_messages is True
+    assert config.compress_user_messages is True
+
+
 class _DummyMetrics:
+    def __init__(self) -> None:
+        self.recorded_requests: list[dict] = []
+        self.tokens_saved_total = 0
+        self.requests_by_model: dict[str, int] = {}
+        self.requests_by_provider: dict[str, int] = {}
+
     async def record_request(self, **kwargs):  # noqa: ANN003
+        self.recorded_requests.append(kwargs)
+        self.tokens_saved_total += int(kwargs.get("tokens_saved", 0))
+        model = str(kwargs.get("model", "unknown"))
+        provider = str(kwargs.get("provider", "unknown"))
+        self.requests_by_model[model] = self.requests_by_model.get(model, 0) + 1
+        self.requests_by_provider[provider] = self.requests_by_provider.get(provider, 0) + 1
         return None
 
     async def record_failed(self, **kwargs):  # noqa: ANN003
@@ -144,6 +174,9 @@ class _DummyMetrics:
 
 
 class _DummyTokenizer:
+    def count_text(self, text):
+        return len(str(text).split())
+
     def count_messages(self, messages):
         return len(messages)
 
@@ -157,6 +190,18 @@ class _ResponseStub:
         return {"usage": {"input_tokens": 2, "output_tokens": 1}}
 
 
+class _ResponseWithoutUsageStub(_ResponseStub):
+    content = b'{"id":"resp_123","output":[{"type":"message"}]}'
+
+    def json(self):
+        return {"id": "resp_123", "output": [{"type": "message"}]}
+
+
+class _ResponseWithZeroUsageStub(_ResponseStub):
+    def json(self):
+        return {"usage": {"input_tokens": 0, "output_tokens": 1}}
+
+
 class _DummyOpenAIHandler(OpenAIHandlerMixin):
     OPENAI_API_URL = "https://api.openai.com"
 
@@ -165,6 +210,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.metrics = _DummyMetrics()
         self.config = SimpleNamespace(
             optimize=False,
+            mode="balanced",
             retry_max_attempts=3,
             retry_base_delay_ms=10,
             retry_max_delay_ms=50,
@@ -185,6 +231,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         )
         self.captured_request: tuple[str, str, dict, dict] | None = None
         self.captured_stream_request: tuple[str, dict, dict] | None = None
+        self.recorded_outcomes: list = []
 
     async def _next_request_id(self) -> str:
         return "req-1"
@@ -208,6 +255,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         # matches HeadroomProxy._record_request_outcome.
         from headroom.proxy.outcome import emit_request_outcome
 
+        self.recorded_outcomes.append(outcome)
         await emit_request_outcome(self, outcome)
 
     async def _stream_response(
@@ -259,6 +307,131 @@ def _build_request(body: dict, headers: dict[str, str]) -> Request:
         "server": ("testserver", 443),
     }
     return Request(scope, receive)
+
+
+def _use_response_without_usage(handler: _DummyOpenAIHandler) -> None:
+    async def retry_request(method, url, headers, body, **kwargs):  # noqa: ANN001, ANN003
+        handler.captured_request = (method, url, headers, body)
+        return _ResponseWithoutUsageStub()
+
+    handler._retry_request = retry_request
+
+
+def _use_response_with_zero_usage(handler: _DummyOpenAIHandler) -> None:
+    async def retry_request(method, url, headers, body, **kwargs):  # noqa: ANN001, ANN003
+        handler.captured_request = (method, url, headers, body)
+        return _ResponseWithZeroUsageStub()
+
+    handler._retry_request = retry_request
+
+
+def test_responses_array_accounting_includes_multipart_messages_tool_output_and_arguments(
+    monkeypatch,
+):
+    payload = {
+        "model": "gpt-5.5",
+        "instructions": "Reply with one sentence.",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "A" * 400},
+                    {"type": "output_text", "text": "B" * 300},
+                    {"type": "text", "text": "C" * 200},
+                    {"type": "input_image", "text": "ignored-image-text"},
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": '{"path":"src/large_file.py","line_end":400}',
+            },
+            {
+                "type": "function_call_output",
+                "id": "out_1",
+                "call_id": "call_1",
+                "output": {"stdout": "D" * 600, "exit_code": 0},
+            },
+            {
+                "type": "computer_call_output",
+                "id": "out_2",
+                "call_id": "call_2",
+                "output": "E" * 300,
+            },
+        ],
+    }
+    counter = CharacterCounter(chars_per_token=1.0)
+    accounting_messages = _responses_input_to_token_messages(
+        payload["instructions"], payload["input"]
+    )
+
+    assert [message["role"] for message in accounting_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+    ]
+    assert accounting_messages[1]["content"] == f"{'A' * 400}\n{'B' * 300}\n{'C' * 200}"
+    assert "ignored-image-text" not in accounting_messages[1]["content"]
+    assert accounting_messages[2]["tool_calls"][0]["function"]["arguments"] == (
+        '{"path":"src/large_file.py","line_end":400}'
+    )
+    assert '"stdout":"' in accounting_messages[3]["content"]
+    assert accounting_messages[4]["content"] == "E" * 300
+
+    handler = _DummyOpenAIHandler()
+    _use_response_without_usage(handler)
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda _model: counter)
+
+    response = anyio.run(
+        handler.handle_openai_responses,
+        _build_request(payload, {"Authorization": "Bearer sk-test"}),
+    )
+
+    expected = _count_openai_responses_payload_tokens(counter, payload)
+    shortened = json.loads(json.dumps(payload))
+    shortened["input"][2]["output"] = "ok"
+    assert response.status_code == 200
+    assert expected > 1_500
+    assert _count_openai_responses_payload_tokens(counter, shortened) < expected
+    assert handler.recorded_outcomes[-1].original_tokens == expected
+    assert handler.recorded_outcomes[-1].optimized_tokens == expected
+    assert handler.recorded_outcomes[-1].tokens_saved == 0
+    assert handler.metrics.recorded_requests[-1]["input_tokens"] == expected
+
+
+def test_responses_zero_upstream_usage_keeps_nonempty_payload_fallback(monkeypatch):
+    payload = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "payload text " * 200}],
+            }
+        ],
+    }
+    counter = CharacterCounter(chars_per_token=4.0)
+    handler = _DummyOpenAIHandler()
+    _use_response_with_zero_usage(handler)
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda _model: counter)
+
+    response = anyio.run(
+        handler.handle_openai_responses,
+        _build_request(payload, {"Authorization": "Bearer sk-test"}),
+    )
+
+    expected = _count_openai_responses_payload_tokens(counter, payload)
+    outcome = handler.recorded_outcomes[-1]
+    assert response.status_code == 200
+    assert expected > 0
+    assert outcome.original_tokens == expected
+    assert outcome.optimized_tokens == expected
+    assert outcome.tokens_saved == 0
 
 
 def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch):
@@ -337,6 +510,193 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     assert headers.get("ChatGPT-Account-ID") is None
     assert body["input"] == "hello"
     assert response.status_code == 200
+    assert handler.recorded_outcomes[-1].original_tokens == 2
+    assert handler.recorded_outcomes[-1].optimized_tokens == 2
+    assert handler.recorded_outcomes[-1].tokens_saved == 0
+
+
+def test_handle_openai_responses_header_opts_into_message_compression_and_is_stripped(
+    monkeypatch,
+):
+    request = _build_request(
+        {"model": "gpt-5.4", "input": "hello"},
+        {
+            "Authorization": "Bearer sk-test",
+            "x-headroom-compress-messages": "true",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    captured: dict[str, bool] = {}
+
+    async def fake_compress(payload, **kwargs):  # noqa: ANN001, ANN003
+        captured["compress_responses_messages"] = bool(kwargs.get("compress_responses_messages"))
+        return payload, False, 0, [], "router_no_compression", 10, 10, 0, {}
+
+    handler._compress_openai_responses_payload_in_executor = fake_compress
+
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert captured["compress_responses_messages"] is True
+    assert handler.captured_request is not None
+    _method, _url, headers, _body = handler.captured_request
+    assert "x-headroom-compress-messages" not in {key.lower() for key in headers}
+
+
+def test_handle_openai_responses_replays_large_codex_array_input_with_truthful_accounting(
+    monkeypatch,
+):
+    file_text = "\n".join(
+        f"{line:02d}: def process_record_{line}(record): return record.get('field_{line}') "
+        "# deterministic fixture content with enough detail to resemble a pasted source file"
+        for line in range(40)
+    )
+    pasted_file = "\n".join([file_text, file_text, file_text])
+    payload = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": pasted_file}],
+            }
+        ],
+        "instructions": "Reply ok only.",
+    }
+    counter = EstimatingTokenCounter()
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.config.compress_responses_messages = False
+    handler.config.compress_user_messages = False
+    handler.config.protect_recent = None
+    handler.openai_pipeline = SimpleNamespace(transforms=[ContentRouter()])
+    handler.openai_provider = SimpleNamespace(
+        get_context_limit=lambda _model: 128_000,
+        get_token_counter=lambda _model: counter,
+    )
+    _use_response_without_usage(handler)
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda _model: counter)
+
+    response = anyio.run(
+        handler.handle_openai_responses,
+        _build_request(
+            payload,
+            {
+                "Authorization": "Bearer sk-test",
+                "x-headroom-compress-messages": "true",
+            },
+        ),
+    )
+
+    outcome = handler.recorded_outcomes[-1]
+    assert response.status_code == 200
+    assert outcome.original_tokens > 2_000
+    # The header grants user-message eligibility, but protect_recent defaults
+    # to 6. This sole message is the newest turn, so it must remain verbatim.
+    assert outcome.optimized_tokens == outcome.original_tokens
+    assert outcome.tokens_saved == 0
+    assert handler.captured_request is not None
+    _method, _url, headers, sent_body = handler.captured_request
+    assert sent_body == payload
+    assert "x-headroom-compress-messages" not in {key.lower() for key in headers}
+
+
+def test_handle_openai_responses_message_savings_reach_metrics_log_and_cost_once(monkeypatch):
+    old_text = "\n".join(
+        f"old segment {idx} contains deterministic message compression context and detail."
+        for idx in range(40)
+    )
+    payload = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": old_text}],
+            },
+            *[
+                {
+                    "type": "message",
+                    "role": "assistant" if idx % 2 else "user",
+                    "content": [{"type": "text", "text": f"recent turn {idx}"}],
+                }
+                for idx in range(6)
+            ],
+        ],
+    }
+    counter = EstimatingTokenCounter()
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.config.compress_responses_messages = False
+    handler.config.compress_user_messages = False
+    handler.config.protect_recent = None
+    handler.openai_pipeline = SimpleNamespace(transforms=[ContentRouter()])
+    handler.openai_provider = SimpleNamespace(
+        get_context_limit=lambda _model: 128_000,
+        get_token_counter=lambda _model: counter,
+    )
+    handler.cost_tracker = SimpleNamespace(record_tokens=MagicMock(), stats=lambda: {})
+    logged_requests = []
+    handler.logger = SimpleNamespace(_logs=logged_requests, log=logged_requests.append)
+    _use_response_without_usage(handler)
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda _model: counter)
+
+    response = anyio.run(
+        handler.handle_openai_responses,
+        _build_request(
+            payload,
+            {
+                "Authorization": "Bearer sk-test",
+                "X-Client": "codex",
+                "x-headroom-compress-messages": "true",
+            },
+        ),
+    )
+
+    outcome = handler.recorded_outcomes[-1]
+    metrics_call = handler.metrics.recorded_requests[-1]
+    request_log = logged_requests[-1]
+    assert response.status_code == 200
+    assert outcome.tokens_saved > 0
+    assert outcome.original_tokens - outcome.optimized_tokens == outcome.tokens_saved
+    assert metrics_call["tokens_saved"] == outcome.tokens_saved
+    assert request_log.tokens_saved == outcome.tokens_saved
+    assert request_log.input_tokens_original == outcome.original_tokens
+    assert request_log.input_tokens_optimized == outcome.optimized_tokens
+    assert handler.cost_tracker.record_tokens.call_count == 1
+
+    from headroom.proxy.cost import build_session_summary
+    from headroom.proxy.server import _build_agent_usage_summary
+
+    session_summary = build_session_summary(
+        handler,
+        handler.metrics,
+        {},
+        0,
+        outcome.original_tokens,
+    )
+    assert session_summary["compression"]["requests_compressed"] == 1
+    assert session_summary["compression"]["total_tokens_removed"] == outcome.tokens_saved
+
+    agent_usage = _build_agent_usage_summary(
+        [asdict(request_log)],
+        requests_by_provider=handler.metrics.requests_by_provider,
+        requests_by_model=handler.metrics.requests_by_model,
+        global_before_tokens=outcome.original_tokens,
+        global_after_tokens=outcome.optimized_tokens,
+        global_tokens_saved=outcome.tokens_saved,
+        global_output_tokens=outcome.output_tokens,
+    )
+    codex = next(row for row in agent_usage["agents"] if row["agent"] == "codex")
+    assert codex["before_tokens"] == outcome.original_tokens
+    assert codex["after_tokens"] == outcome.optimized_tokens
+    assert codex["tokens_saved"] == outcome.tokens_saved
 
 
 def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):

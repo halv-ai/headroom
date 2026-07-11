@@ -53,6 +53,14 @@ _EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
 # the block is recognizable in logs/diffs.
 _STEERING_SENTINEL = "<headroom_output_shaping>"
 _STEERING_SUFFIX = "</headroom_output_shaping>"
+_RESPONSES_TOOL_OUTPUT_TYPES = frozenset(
+    {
+        "custom_tool_call_output",
+        "function_call_output",
+        "local_shell_call_output",
+        "apply_patch_call_output",
+    }
+)
 
 # Levels are cumulative: each includes everything above it. Text must stay
 # byte-stable across releases for prefix-cache friendliness — treat edits to
@@ -242,6 +250,20 @@ def classify_turn(messages: list[dict[str, Any]]) -> TurnKind:
     return TurnKind.UNKNOWN
 
 
+def classify_responses_turn(input_items: Any) -> TurnKind:
+    """Classify a Responses turn from the latest input item structure."""
+    if not isinstance(input_items, list) or not input_items:
+        return TurnKind.UNKNOWN
+    last = input_items[-1]
+    if not isinstance(last, dict):
+        return TurnKind.UNKNOWN
+    if last.get("type") in _RESPONSES_TOOL_OUTPUT_TYPES:
+        return TurnKind.MECHANICAL_CONTINUATION
+    if last.get("type") == "message" and last.get("role") == "user":
+        return TurnKind.NEW_USER_ASK
+    return TurnKind.UNKNOWN
+
+
 def steering_text(level: int) -> str | None:
     """The full steering block for a verbosity level, or None for level 0."""
     text = _VERBOSITY_LEVELS.get(level)
@@ -286,6 +308,33 @@ def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
     return False
 
 
+def apply_responses_verbosity_steering(body: dict[str, Any], level: int) -> bool:
+    """Append or replace the steering block at the tail of Responses instructions."""
+    text = steering_text(level)
+    if text is None:
+        return False
+
+    instructions = body.get("instructions")
+    if instructions is None:
+        body["instructions"] = text
+        return True
+    if not isinstance(instructions, str):
+        return False
+
+    start = instructions.find(_STEERING_SENTINEL)
+    if start >= 0:
+        end = instructions.find(_STEERING_SUFFIX, start)
+        if end >= 0:
+            end += len(_STEERING_SUFFIX)
+            if instructions[start:end] == text:
+                return False
+            body["instructions"] = instructions[:start] + text + instructions[end:]
+            return True
+
+    body["instructions"] = f"{instructions}\n\n{text}" if instructions else text
+    return True
+
+
 def route_effort(
     body: dict[str, Any],
     kind: TurnKind,
@@ -325,6 +374,30 @@ def route_effort(
     return labels
 
 
+def route_responses_effort(
+    body: dict[str, Any],
+    kind: TurnKind,
+) -> list[str]:
+    """Lower Responses reasoning.effort by one level on mechanical continuations."""
+    if kind is not TurnKind.MECHANICAL_CONTINUATION:
+        return []
+
+    reasoning = body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return []
+    effort = reasoning.get("effort")
+    if not isinstance(effort, str) or effort not in _EFFORT_RANK:
+        return []
+    rank = _EFFORT_RANK[effort]
+    if rank <= 0:
+        return []
+
+    by_rank = {value: key for key, value in _EFFORT_RANK.items()}
+    lowered = by_rank[rank - 1]
+    reasoning["effort"] = lowered
+    return [f"output_shaper:responses_effort:{effort}->{lowered}"]
+
+
 def shape_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
@@ -356,5 +429,35 @@ def shape_request(
             result.changed = True
             result.labels.extend(labels)
         logger.debug("OutputShaper: turn=%s mutations=%s", kind.value, labels)
+
+    return result
+
+
+def shape_responses_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+    level_override: int | None = None,
+) -> ShapeResult:
+    """Apply output shaping to an OpenAI Responses request body in place."""
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    result = ShapeResult()
+    if not settings.enabled:
+        return result
+
+    assert result.labels is not None  # __post_init__ guarantees this
+
+    level = settings.verbosity_level if level_override is None else level_override
+    if level > 0 and apply_responses_verbosity_steering(body, level):
+        result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
+
+    if settings.effort_router_enabled:
+        kind = classify_responses_turn(body.get("input"))
+        labels = route_responses_effort(body, kind)
+        if labels:
+            result.changed = True
+            result.labels.extend(labels)
+        logger.debug("OutputShaper(Responses): turn=%s mutations=%s", kind.value, labels)
 
     return result

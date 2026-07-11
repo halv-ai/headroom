@@ -808,7 +808,17 @@ class StreamingMixin:
             and provider_input_tokens > 0
         ):
             effective_optimized_tokens = provider_input_tokens
-            effective_original_tokens = max(original_tokens, provider_input_tokens + tokens_saved)
+            if provider == "openai" and "input" in body:
+                # Responses usage is authoritative for the payload actually
+                # sent. Reconstruct its pre-compression side from the same saved
+                # delta so before - after remains truthful; the local fallback
+                # estimate can otherwise overstate `before_tokens`.
+                effective_original_tokens = provider_input_tokens + tokens_saved
+            else:
+                effective_original_tokens = max(
+                    original_tokens,
+                    provider_input_tokens + tokens_saved,
+                )
 
         cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
         cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0

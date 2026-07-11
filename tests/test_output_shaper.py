@@ -13,10 +13,14 @@ from headroom.proxy.output_shaper import (
     LEGACY_THINKING_FLOOR,
     OutputShaperSettings,
     TurnKind,
+    apply_responses_verbosity_steering,
     apply_verbosity_steering,
+    classify_responses_turn,
     classify_turn,
     route_effort,
+    route_responses_effort,
     shape_request,
+    shape_responses_request,
     steering_text,
 )
 
@@ -282,3 +286,124 @@ class TestShapeRequest:
         settings = OutputShaperSettings.from_env()
         assert settings.verbosity_level == 4
         assert settings.mechanical_effort == "low"
+
+
+# ---------------------------------------------------------------------------
+# Responses output shaping
+# ---------------------------------------------------------------------------
+
+
+class TestResponsesVerbositySteering:
+    def test_missing_instructions_creates_steering_string(self):
+        body: dict[str, Any] = {}
+        assert apply_responses_verbosity_steering(body, 2) is True
+        assert body["instructions"] == steering_text(2)
+
+    def test_appends_to_instruction_tail_and_is_idempotent(self):
+        body = {"instructions": "Keep answers short."}
+        assert apply_responses_verbosity_steering(body, 2) is True
+        snapshot = copy.deepcopy(body)
+        assert body["instructions"] == f"Keep answers short.\n\n{steering_text(2)}"
+        assert apply_responses_verbosity_steering(body, 2) is False
+        assert body == snapshot
+
+    def test_level_change_replaces_sentinel_in_place(self):
+        body = {"instructions": "Keep answers short."}
+        apply_responses_verbosity_steering(body, 2)
+        assert apply_responses_verbosity_steering(body, 4) is True
+        assert body["instructions"] == f"Keep answers short.\n\n{steering_text(4)}"
+        assert body["instructions"].count("<headroom_output_shaping>") == 1
+
+    def test_non_string_instructions_are_untouched(self):
+        body = {"instructions": [{"type": "text", "text": "Sys."}]}
+        assert apply_responses_verbosity_steering(body, 2) is False
+        assert body == {"instructions": [{"type": "text", "text": "Sys."}]}
+
+
+class TestResponsesEffortRouting:
+    def test_latest_tool_output_is_mechanical(self):
+        assert (
+            classify_responses_turn(
+                [{"type": "function_call_output", "call_id": "c1", "output": "ok"}]
+            )
+            == TurnKind.MECHANICAL_CONTINUATION
+        )
+
+    def test_user_message_is_new_ask(self):
+        assert (
+            classify_responses_turn(
+                [{"type": "message", "role": "user", "content": [{"type": "input_text"}]}]
+            )
+            == TurnKind.NEW_USER_ASK
+        )
+
+    def test_lowers_reasoning_effort_one_level_on_mechanical_turn(self):
+        body = {"reasoning": {"effort": "high"}}
+        labels = route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION)
+        assert body["reasoning"]["effort"] == "medium"
+        assert labels == ["output_shaper:responses_effort:high->medium"]
+
+    def test_never_injects_reasoning_when_absent(self):
+        body: dict[str, Any] = {}
+        assert route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION) == []
+        assert "reasoning" not in body
+
+    def test_never_raises_effort_or_changes_new_ask(self):
+        body = {"reasoning": {"effort": "low"}}
+        assert route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION) == []
+        assert body["reasoning"]["effort"] == "low"
+
+        new_ask_body = {"reasoning": {"effort": "high"}}
+        assert route_responses_effort(new_ask_body, TurnKind.NEW_USER_ASK) == []
+        assert new_ask_body["reasoning"]["effort"] == "high"
+
+
+class TestShapeResponsesRequest:
+    def test_disabled_is_noop(self):
+        body = {
+            "instructions": "Sys.",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "ok"}],
+            "reasoning": {"effort": "high"},
+        }
+        snapshot = copy.deepcopy(body)
+        result = shape_responses_request(body, OutputShaperSettings(enabled=False))
+        assert result.changed is False
+        assert body == snapshot
+
+    def test_enabled_applies_steering_and_effort_routing(self):
+        body = {
+            "instructions": "Sys.",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "ok"}],
+            "reasoning": {"effort": "high"},
+            "max_output_tokens": 4096,
+        }
+        result = shape_responses_request(body, ENABLED)
+        assert result.changed is True
+        assert result.labels == [
+            "output_shaper:verbosity:L2",
+            "output_shaper:responses_effort:high->medium",
+        ]
+        assert body["instructions"] == f"Sys.\n\n{steering_text(2)}"
+        assert body["reasoning"]["effort"] == "medium"
+        assert body["max_output_tokens"] == 4096
+
+    def test_new_ask_gets_steering_but_keeps_effort(self):
+        body = {
+            "instructions": "Sys.",
+            "input": [{"type": "message", "role": "user", "content": "design a cache layer"}],
+            "reasoning": {"effort": "high"},
+        }
+        result = shape_responses_request(body, ENABLED)
+        assert result.labels == ["output_shaper:verbosity:L2"]
+        assert body["reasoning"]["effort"] == "high"
+
+    def test_second_pass_is_stable(self):
+        body = {
+            "instructions": "Sys.",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "ok"}],
+        }
+        shape_responses_request(body, ENABLED)
+        snapshot = copy.deepcopy(body)
+        result = shape_responses_request(body, ENABLED)
+        assert result.changed is False
+        assert body == snapshot

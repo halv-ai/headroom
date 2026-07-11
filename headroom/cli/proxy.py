@@ -247,6 +247,24 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--compress-user-messages",
+    is_flag=True,
+    envvar="HEADROOM_COMPRESS_USER_MESSAGES",
+    help=(
+        "Opt in to compressing user-role messages for chat workloads. "
+        "Default: off. Env: HEADROOM_COMPRESS_USER_MESSAGES=1."
+    ),
+)
+@click.option(
+    "--compress-responses-messages",
+    is_flag=True,
+    envvar="HEADROOM_COMPRESS_RESPONSES_MESSAGES",
+    help=(
+        "Opt in to compressing older OpenAI Responses message items. "
+        "Default: off. Env: HEADROOM_COMPRESS_RESPONSES_MESSAGES=1."
+    ),
+)
+@click.option(
     "--intercept-tool-results",
     is_flag=True,
     help=(
@@ -815,6 +833,8 @@ def proxy(
     ctx: click.Context,
     mode: str | None,
     target_ratio: float | None,
+    compress_user_messages: bool,
+    compress_responses_messages: bool,
     host: str,
     port: int,
     workers: int,
@@ -1053,7 +1073,8 @@ def proxy(
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
-        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        compress_user_messages=compress_user_messages,
+        compress_responses_messages=compress_responses_messages,
         min_tokens_to_crush=_get_env_int_optional("HEADROOM_MIN_TOKENS") or 500,
         max_items_after_crush=_get_env_int_optional("HEADROOM_MAX_ITEMS") or 50,
         exclude_tools=_parse_exclude_tools(None) or None,

@@ -193,6 +193,10 @@ class ProxyConfig:
     # router would otherwise have nothing eligible to compress.
     # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1.
     compress_user_messages: bool = False
+    # Opt in to compressing older OpenAI Responses `message` items. Off by
+    # default to preserve prefix-cache stability for chat histories.
+    # CLI: --compress-responses-messages; env: HEADROOM_COMPRESS_RESPONSES_MESSAGES=1.
+    compress_responses_messages: bool = False
     # Named savings policy shared across Claude/Codex/Cursor proxy handlers.
     # CLI/env: HEADROOM_SAVINGS_PROFILE=agent-90.
     savings_profile: str | None = None

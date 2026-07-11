@@ -127,6 +127,24 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (o
 
 Reproduce: `python -m headroom.evals suite --tier 1` · [Full benchmarks & methodology](https://headroom-docs.vercel.app/docs/benchmarks)
 
+## OpenAI Responses message compression
+
+By default, the OpenAI Responses path compresses tool-output items and leaves
+chat `message` history untouched for prefix-cache stability. For chat-heavy
+Responses clients, opt in to compressing older assistant messages:
+
+```bash
+export HEADROOM_COMPRESS_RESPONSES_MESSAGES=1
+headroom proxy --port 8787
+```
+
+Per request, send `x-headroom-compress-messages: true`; that explicit client
+opt-in covers eligible older user and assistant messages. With only the global
+Responses setting, user-role messages still require
+`HEADROOM_COMPRESS_USER_MESSAGES=1` or `--compress-user-messages`. The newest
+six message items remain verbatim by default, and older message text uses a
+byte-deterministic extractive transform so repeated prefixes stay stable.
+
 ## Output token reduction (cut what the model writes back)
 
 Everything above shrinks the prompt you **send**. But you also pay for every

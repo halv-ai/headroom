@@ -209,8 +209,10 @@ async def test_finalize_openai_responses_stream_uses_provider_usage_for_dashboar
         provider="openai",
         model="gpt-5.5",
         request_id="req-openai-responses-stream",
-        original_tokens=0,
-        optimized_tokens=0,
+        # Deliberately higher local estimates prove provider Responses usage
+        # wins without breaking before - after == tokens_saved.
+        original_tokens=2_000_000,
+        optimized_tokens=1_337_000,
         tokens_saved=663_000,
         transforms_applied=["openai_responses_live_zone"],
         optimization_latency=26.0,

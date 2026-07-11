@@ -315,7 +315,13 @@ async def test_ws_first_frame_compression_uses_bounded_executor():
     upstream = _FakeUpstream(upstream_events)
     fake_ws_mod = _make_fake_websockets_module(upstream)
 
-    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame()],
+        headers={
+            "authorization": "Bearer test",
+            "X-Headroom-Compress-Messages": "true",
+        },
+    )
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
     handler._compress_openai_responses_payload = MagicMock(
@@ -336,6 +342,10 @@ async def test_ws_first_frame_compression_uses_bounded_executor():
     assert handler.compression_executor_calls == 1
     assert handler.compression_executor_timeouts == [COMPRESSION_TIMEOUT_SECONDS]
     handler._compress_openai_responses_payload.assert_called_once()
+    assert (
+        handler._compress_openai_responses_payload.call_args.kwargs["compress_responses_messages"]
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -433,7 +443,15 @@ async def test_ws_session_metrics_include_dashboard_performance_timings():
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
 
-    def _noop_compress(payload, *, model, request_id, timing=None):
+    def _noop_compress(
+        payload,
+        *,
+        model,
+        request_id,
+        timing=None,
+        compress_responses_messages=False,
+    ):
+        assert compress_responses_messages is False
         if timing is not None:
             timing["compression_live_unit_extraction"] = 2.0
             timing["compression_unit_router_strategy_passthrough"] = 3.0

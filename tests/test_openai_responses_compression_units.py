@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 import threading
 from types import MethodType, SimpleNamespace
 
@@ -24,7 +26,28 @@ def _handler_with_router(router: ContentRouter) -> OpenAIHandlerMixin:
     handler.openai_provider = SimpleNamespace(
         get_token_counter=lambda _model: TokenCounter(),
     )
+    handler.config = SimpleNamespace(
+        compress_responses_messages=False,
+        compress_user_messages=False,
+        protect_recent=None,
+    )
     return handler
+
+
+def _message_item(role: str, text: str, part_type: str = "input_text") -> dict:
+    return {
+        "type": "message",
+        "role": role,
+        "content": [{"type": part_type, "text": text}],
+    }
+
+
+def _long_message_text(prefix: str, segments: int = 40) -> str:
+    return "\n".join(
+        f"{prefix} segment {idx} contains deterministic compression details "
+        "with enough distinct context to remain useful."
+        for idx in range(segments)
+    )
 
 
 def test_openai_responses_unit_parallelism_env_defaults_and_clamps(monkeypatch):
@@ -174,6 +197,203 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
     assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
     assert strategy_chain == []
+
+
+def test_openai_responses_adapter_leaves_message_items_untouched_without_opt_in():
+    handler = _handler_with_router(ContentRouter())
+    handler.config.protect_recent = 0
+    assistant_text = _long_message_text("assistant")
+    payload = {
+        "model": "gpt-5",
+        "input": [_message_item("assistant", assistant_text, "output_text")],
+    }
+
+    new_payload, modified, saved, transforms, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_message_off",
+        )
+    )
+
+    assert modified is False
+    assert saved == 0
+    assert transforms == []
+    assert new_payload == payload
+
+
+def test_openai_responses_adapter_compresses_old_assistant_messages_when_enabled():
+    handler = _handler_with_router(ContentRouter())
+    handler.config.compress_responses_messages = True
+    handler.config.protect_recent = 0
+    long_text = _long_message_text("assistant")
+    user_text = _long_message_text("user")
+    system_text = _long_message_text("system")
+    developer_text = _long_message_text("developer")
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            _message_item("system", system_text),
+            _message_item("developer", developer_text),
+            _message_item("assistant", long_text, "output_text"),
+            _message_item("user", user_text),
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_message_assistant",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["content"][0]["text"] == system_text
+    assert new_payload["input"][1]["content"][0]["text"] == developer_text
+    assert new_payload["input"][2]["content"][0]["text"] != long_text
+    assert new_payload["input"][3]["content"][0]["text"] == user_text
+    assert "router:openai:responses:message:text_crusher" in transforms
+    assert units_by_category == {"applied": 1}
+
+
+def test_openai_responses_adapter_compresses_user_messages_only_with_user_opt_in():
+    router = ContentRouter()
+    long_text = _long_message_text("user")
+    payload = {"model": "gpt-5", "input": [_message_item("user", long_text)]}
+
+    blocked_handler = _handler_with_router(router)
+    blocked_handler.config.compress_responses_messages = True
+    blocked_handler.config.compress_user_messages = False
+    blocked_handler.config.protect_recent = 0
+    blocked_payload, blocked_modified, blocked_saved, blocked_transforms, *_ = (
+        blocked_handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_message_user_blocked",
+        )
+    )
+
+    assert blocked_modified is False
+    assert blocked_saved == 0
+    assert blocked_transforms == []
+    assert blocked_payload == payload
+
+    enabled_handler = _handler_with_router(router)
+    enabled_handler.config.compress_responses_messages = True
+    enabled_handler.config.compress_user_messages = True
+    enabled_handler.config.protect_recent = 0
+    new_payload, modified, saved, transforms, units_by_category, *_ = (
+        enabled_handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_message_user_enabled",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["content"][0]["text"] != long_text
+    assert "router:openai:responses:message:text_crusher" in transforms
+    assert units_by_category == {"applied": 1}
+
+
+def test_openai_responses_header_opt_in_compresses_old_user_and_protects_recent_messages():
+    handler = _handler_with_router(ContentRouter())
+    handler.config.protect_recent = 2
+    old_text = _long_message_text("old user")
+    recent_one = _long_message_text("recent assistant")
+    recent_two = _long_message_text("recent user")
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "id": "msg_old",
+                **_message_item("user", old_text),
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": '{"query":"stable"}',
+            },
+            {"type": "reasoning", "id": "rs_1", "summary": [{"text": "keep exactly"}]},
+            _message_item("assistant", recent_one, "output_text"),
+            {
+                "type": "function_call_output",
+                "id": "out_1",
+                "call_id": "call_1",
+                "output": "short output stays verbatim",
+            },
+            _message_item("user", recent_two),
+            {"type": "reasoning", "id": "rs_2", "encrypted_content": "opaque"},
+        ],
+    }
+    original = copy.deepcopy(payload)
+
+    new_payload, modified, saved, transforms, units_by_category, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_message_protect_recent",
+            compress_responses_messages=True,
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["content"][0]["text"] != old_text
+    assert new_payload["input"][3]["content"][0]["text"] == recent_one
+    assert new_payload["input"][5]["content"][0]["text"] == recent_two
+    assert "router:openai:responses:message:text_crusher" in transforms
+    assert units_by_category == {"applied": 1, "size_floor": 1}
+    # Only the old message text slot may change. Function pairing, item ids,
+    # reasoning objects, ordering, and protected recent messages stay byte-shape equal.
+    assert [item.get("id") for item in new_payload["input"]] == [
+        item.get("id") for item in original["input"]
+    ]
+    assert new_payload["input"][1:] == original["input"][1:]
+    assert new_payload["input"][0]["id"] == original["input"][0]["id"]
+    assert new_payload["input"][0]["role"] == original["input"][0]["role"]
+
+
+def test_openai_responses_message_compression_is_byte_identical_across_cold_handlers():
+    first_handler = _handler_with_router(ContentRouter())
+    first_handler.config.compress_responses_messages = True
+    first_handler.config.protect_recent = 0
+    second_handler = _handler_with_router(ContentRouter())
+    second_handler.config.compress_responses_messages = True
+    second_handler.config.protect_recent = 0
+    long_text = _long_message_text("stable prefix")
+    payload = {
+        "model": "gpt-5",
+        "input": [_message_item("assistant", long_text, "output_text")],
+    }
+
+    first, first_modified, first_saved, *_ = (
+        first_handler._compress_openai_responses_live_text_units_with_router(
+            copy.deepcopy(payload),
+            model="gpt-5",
+            request_id="req_message_determinism_first",
+        )
+    )
+    second, second_modified, second_saved, *_ = (
+        second_handler._compress_openai_responses_live_text_units_with_router(
+            copy.deepcopy(payload),
+            model="gpt-5",
+            request_id="req_message_determinism_second",
+        )
+    )
+
+    first_bytes = json.dumps(first, ensure_ascii=False, separators=(",", ":")).encode()
+    second_bytes = json.dumps(second, ensure_ascii=False, separators=(",", ":")).encode()
+    assert first_bytes == second_bytes
+    assert first_modified is True
+    assert second_modified is True
+    assert first_saved > 0
+    assert second_saved == first_saved
 
 
 def test_openai_responses_adapter_reuses_exact_tool_output_cache():
