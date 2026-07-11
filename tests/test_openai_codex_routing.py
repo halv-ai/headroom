@@ -146,11 +146,13 @@ def test_responses_message_env_config_keeps_user_gate_independent(monkeypatch) -
     monkeypatch.delenv("HEADROOM_PROXY_CONFIG_JSON", raising=False)
     monkeypatch.setenv("HEADROOM_COMPRESS_RESPONSES_MESSAGES", "1")
     monkeypatch.setenv("HEADROOM_COMPRESS_USER_MESSAGES", "1")
+    monkeypatch.setenv("HEADROOM_PROTECT_RECENT", "0")
 
     config = _proxy_config_from_env()
 
     assert config.compress_responses_messages is True
     assert config.compress_user_messages is True
+    assert config.protect_recent == 0
 
 
 class _DummyMetrics:
@@ -548,7 +550,7 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     assert handler.recorded_outcomes[-1].tokens_saved == 0
 
 
-def test_handle_openai_responses_header_opts_into_message_compression_and_is_stripped(
+def test_handle_openai_responses_internal_compression_headers_override_config_and_are_stripped(
     monkeypatch,
 ):
     request = _build_request(
@@ -556,14 +558,17 @@ def test_handle_openai_responses_header_opts_into_message_compression_and_is_str
         {
             "Authorization": "Bearer sk-test",
             "x-headroom-compress-messages": "true",
+            "x-headroom-protect-recent": "0",
         },
     )
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
-    captured: dict[str, bool] = {}
+    handler.config.protect_recent = 4
+    captured: dict[str, bool | int] = {}
 
     async def fake_compress(payload, **kwargs):  # noqa: ANN001, ANN003
         captured["compress_responses_messages"] = bool(kwargs.get("compress_responses_messages"))
+        captured["protect_recent"] = int(kwargs["protect_recent"])
         return payload, False, 0, [], "router_no_compression", 10, 10, 0, {}
 
     handler._compress_openai_responses_payload_in_executor = fake_compress
@@ -575,9 +580,12 @@ def test_handle_openai_responses_header_opts_into_message_compression_and_is_str
 
     assert response.status_code == 200
     assert captured["compress_responses_messages"] is True
+    assert captured["protect_recent"] == 0
     assert handler.captured_request is not None
     _method, _url, headers, _body = handler.captured_request
-    assert "x-headroom-compress-messages" not in {key.lower() for key in headers}
+    forwarded_header_names = {key.lower() for key in headers}
+    assert "x-headroom-compress-messages" not in forwarded_header_names
+    assert "x-headroom-protect-recent" not in forwarded_header_names
 
 
 def test_handle_openai_responses_replays_large_codex_array_input_with_truthful_accounting(

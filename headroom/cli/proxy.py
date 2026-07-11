@@ -1115,6 +1115,7 @@ def proxy(
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
         compress_user_messages=compress_user_messages,
+        protect_recent=_get_env_int("HEADROOM_PROTECT_RECENT", 6),
         compress_responses_messages=compress_responses_messages,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", 500),
         max_items_after_crush=_get_env_int("HEADROOM_MAX_ITEMS", 50),
@@ -1127,7 +1128,6 @@ def proxy(
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
         target_ratio=target_ratio,
         compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
-        protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
         accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
         # CCR opt-out: --no-ccr disables both halves at once (markers in content

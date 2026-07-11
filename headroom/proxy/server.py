@@ -4298,6 +4298,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
         force_kompress_all=_get_env_bool("HEADROOM_FORCE_KOMPRESS_ALL", False),
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        protect_recent=_get_env_int("HEADROOM_PROTECT_RECENT", 6, min_value=0),
         compress_responses_messages=_get_env_bool("HEADROOM_COMPRESS_RESPONSES_MESSAGES", False),
         lossless=_get_env_bool("HEADROOM_LOSSLESS", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
@@ -5013,11 +5014,7 @@ if __name__ == "__main__":
             if "HEADROOM_COMPRESS_SYSTEM_MESSAGES" in os.environ
             else None
         ),
-        protect_recent=(
-            int(os.environ["HEADROOM_PROTECT_RECENT"])
-            if os.environ.get("HEADROOM_PROTECT_RECENT")
-            else None
-        ),
+        protect_recent=_get_env_int("HEADROOM_PROTECT_RECENT", 6, min_value=0),
         protect_analysis_context=(
             _get_env_bool("HEADROOM_PROTECT_ANALYSIS_CONTEXT", False)
             if "HEADROOM_PROTECT_ANALYSIS_CONTEXT" in os.environ

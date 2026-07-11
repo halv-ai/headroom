@@ -303,7 +303,10 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
         kwargs["compress_system_messages"] = bool(compress_system_messages)
 
     protect_recent = getattr(config, "protect_recent", None)
-    if protect_recent is not None:
+    # ProxyConfig's default of 6 belongs to Responses message recency. A named
+    # savings profile keeps its own cross-provider window unless the config
+    # supplies a non-default override.
+    if protect_recent is not None and (not profile_name or int(protect_recent) != 6):
         kwargs["protect_recent"] = int(protect_recent)
 
     protect_analysis_context = getattr(config, "protect_analysis_context", None)

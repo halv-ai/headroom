@@ -274,6 +274,34 @@ class TestCLIProxyEnvVars:
         assert captured_config["config"].min_tokens_to_crush == 0
         assert captured_config["config"].max_items_after_crush == 0
 
+    def test_headroom_protect_recent_from_env_preserves_zero_and_defaults_to_six(self, runner):
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_PROTECT_RECENT": "0"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].protect_recent == 0
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_PROTECT_RECENT": ""},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].protect_recent == 6
+
     def test_headroom_budget_from_env(self, runner):
         """HEADROOM_BUDGET env var should be passed to ProxyConfig."""
         captured_config = {}

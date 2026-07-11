@@ -204,7 +204,7 @@ class ProxyConfig:
     savings_profile: str | None = None
     target_ratio: float | None = None
     compress_system_messages: bool | None = None
-    protect_recent: int | None = None
+    protect_recent: int = 6
     protect_analysis_context: bool | None = None
     accuracy_guard: str | None = None
 

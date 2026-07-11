@@ -87,6 +87,8 @@ _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 _HEADROOM_COMPRESS_MESSAGES_HEADER = "x-headroom-compress-messages"
+_HEADROOM_PROTECT_RECENT_HEADER = "x-headroom-protect-recent"
+_OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT = 6
 _RESPONSES_MESSAGE_CONTENT_TEXT_TYPES = frozenset({"input_text", "output_text", "text"})
 _OPENCODE_ZEN_HOSTS = {"opencode.ai", "www.opencode.ai"}
 
@@ -1199,6 +1201,35 @@ def _headroom_compress_messages_enabled(headers: Any) -> bool:
     return False
 
 
+def _nonnegative_int_or_default(value: Any, default: int) -> int:
+    """Return ``value`` as a non-negative int, otherwise ``default``."""
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _headroom_protect_recent(
+    headers: Any,
+    configured_default: Any = _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
+) -> int:
+    """Resolve the per-request Responses message recency window."""
+
+    default = _nonnegative_int_or_default(
+        configured_default,
+        _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
+    )
+    try:
+        for key, value in headers.items():
+            if str(key).lower() == _HEADROOM_PROTECT_RECENT_HEADER:
+                return _nonnegative_int_or_default(str(value).strip(), default)
+    except (AttributeError, TypeError):
+        return default
+    return default
+
+
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
@@ -1432,6 +1463,7 @@ class OpenAIHandlerMixin:
         pass_id: str | None = None,
         timing: dict[str, float] | None = None,
         compress_responses_messages: bool = False,
+        protect_recent: int | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -1490,13 +1522,19 @@ class OpenAIHandlerMixin:
         compress_user_messages_enabled = bool(
             compress_responses_messages or profile_kwargs.get("compress_user_messages") is True
         )
-        protect_recent_raw = profile_kwargs.get("protect_recent")
-        try:
-            message_protect_recent = (
-                max(0, int(protect_recent_raw)) if protect_recent_raw is not None else 6
+        protect_recent_raw = (
+            protect_recent
+            if protect_recent is not None
+            else getattr(
+                getattr(self, "config", None),
+                "protect_recent",
+                _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
             )
-        except (TypeError, ValueError):
-            message_protect_recent = 6
+        )
+        message_protect_recent = _nonnegative_int_or_default(
+            protect_recent_raw,
+            _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
+        )
         message_indices = [
             idx
             for idx, item in enumerate(items)
@@ -2168,6 +2206,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timing: dict[str, float] | None = None,
         compress_responses_messages: bool = False,
+        protect_recent: int | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2313,6 +2352,7 @@ class OpenAIHandlerMixin:
             pass_id=pass_id,
             timing=timing_sink,
             compress_responses_messages=compress_responses_messages,
+            protect_recent=protect_recent,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -2433,9 +2473,15 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         compress_responses_messages: bool = False,
+        protect_recent: int | None = None,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
+        compression_kwargs: dict[str, Any] = {
+            "compress_responses_messages": compress_responses_messages,
+        }
+        if protect_recent is not None:
+            compression_kwargs["protect_recent"] = protect_recent
 
         def _compress():  # noqa: ANN202
             try:
@@ -2444,7 +2490,7 @@ class OpenAIHandlerMixin:
                     model=model,
                     request_id=request_id,
                     timing=timing,
-                    compress_responses_messages=compress_responses_messages,
+                    **compression_kwargs,
                 )
             except TypeError as exc:
                 if "unexpected keyword argument 'timing'" not in str(exc):
@@ -2453,7 +2499,7 @@ class OpenAIHandlerMixin:
                     payload,
                     model=model,
                     request_id=request_id,
-                    compress_responses_messages=compress_responses_messages,
+                    **compression_kwargs,
                 )
 
         result = await self._run_compression_in_executor(
@@ -4090,6 +4136,18 @@ class OpenAIHandlerMixin:
         body_mutation_tracker = BodyMutationTracker()
         _bypass = self._headroom_bypass_enabled(request.headers)
         _compress_responses_messages = _headroom_compress_messages_enabled(request.headers)
+        _responses_protect_recent = (
+            _headroom_protect_recent(
+                request.headers,
+                getattr(
+                    getattr(self, "config", None),
+                    "protect_recent",
+                    _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
+                ),
+            )
+            if request.headers.get(_HEADROOM_PROTECT_RECENT_HEADER) is not None
+            else None
+        )
         if _bypass:
             logger.info(
                 "[%s] Responses passthrough reason=bypass_header mutation=disabled",
@@ -4491,6 +4549,7 @@ class OpenAIHandlerMixin:
                     model=model,
                     request_id=request_id,
                     compress_responses_messages=_compress_responses_messages,
+                    protect_recent=_responses_protect_recent,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _modified:
@@ -5107,6 +5166,18 @@ class OpenAIHandlerMixin:
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
         _ws_compress_responses_messages = _headroom_compress_messages_enabled(ws_headers)
+        _ws_protect_recent = (
+            _headroom_protect_recent(
+                ws_headers,
+                getattr(
+                    getattr(self, "config", None),
+                    "protect_recent",
+                    _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
+                ),
+            )
+            if _header_get(ws_headers, _HEADROOM_PROTECT_RECENT_HEADER) is not None
+            else None
+        )
         _ws_url_obj = getattr(websocket, "url", None)
         _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
         _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
@@ -5961,6 +6032,7 @@ class OpenAIHandlerMixin:
                                 model=_model,
                                 request_id=request_id,
                                 compress_responses_messages=_ws_compress_responses_messages,
+                                protect_recent=_ws_protect_recent,
                                 timeout=_codex_ws_compression_timeout_seconds()
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
@@ -6278,6 +6350,7 @@ class OpenAIHandlerMixin:
                                     model=model_for_frame,
                                     request_id=request_id,
                                     compress_responses_messages=_ws_compress_responses_messages,
+                                    protect_recent=_ws_protect_recent,
                                     timeout=_codex_ws_compression_timeout_seconds()
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,

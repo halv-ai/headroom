@@ -5,8 +5,11 @@ import json
 import threading
 from types import MethodType, SimpleNamespace
 
+import pytest
+
 from headroom.proxy.handlers import openai as openai_handler
-from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin, _headroom_protect_recent
+from headroom.proxy.models import ProxyConfig
 from headroom.transforms.compression_units import UnitCompressionResult
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -48,6 +51,28 @@ def _long_message_text(prefix: str, segments: int = 40) -> str:
         "with enough distinct context to remain useful."
         for idx in range(segments)
     )
+
+
+@pytest.mark.parametrize(
+    ("header_value", "expected"),
+    [("0", 0), ("3", 3), ("invalid", 4)],
+    ids=["zero", "positive", "invalid_falls_back"],
+)
+def test_headroom_protect_recent_header_parsing(
+    header_value: str,
+    expected: int,
+) -> None:
+    assert (
+        _headroom_protect_recent(
+            {"X-Headroom-Protect-Recent": header_value},
+            configured_default=4,
+        )
+        == expected
+    )
+
+
+def test_openai_responses_protect_recent_config_defaults_to_six() -> None:
+    assert ProxyConfig().protect_recent == 6
 
 
 def test_openai_responses_unit_parallelism_env_defaults_and_clamps(monkeypatch):
@@ -359,17 +384,17 @@ def test_openai_responses_header_opt_in_compresses_old_user_and_protects_recent_
     assert new_payload["input"][0]["role"] == original["input"][0]["role"]
 
 
-def test_openai_responses_message_compression_is_byte_identical_across_cold_handlers():
+def test_openai_responses_protect_recent_zero_compresses_latest_user_deterministically():
     first_handler = _handler_with_router(ContentRouter())
-    first_handler.config.compress_responses_messages = True
-    first_handler.config.protect_recent = 0
     second_handler = _handler_with_router(ContentRouter())
-    second_handler.config.compress_responses_messages = True
-    second_handler.config.protect_recent = 0
-    long_text = _long_message_text("stable prefix")
+    repeated_line = (
+        "The latest user message repeats this exact redundant sentence while preserving "
+        "deterministic wording."
+    )
+    latest_text = "\n".join([repeated_line] * 10)
     payload = {
         "model": "gpt-5",
-        "input": [_message_item("assistant", long_text, "output_text")],
+        "input": [_message_item("user", latest_text)],
     }
 
     first, first_modified, first_saved, *_ = (
@@ -377,6 +402,8 @@ def test_openai_responses_message_compression_is_byte_identical_across_cold_hand
             copy.deepcopy(payload),
             model="gpt-5",
             request_id="req_message_determinism_first",
+            compress_responses_messages=True,
+            protect_recent=0,
         )
     )
     second, second_modified, second_saved, *_ = (
@@ -384,6 +411,8 @@ def test_openai_responses_message_compression_is_byte_identical_across_cold_hand
             copy.deepcopy(payload),
             model="gpt-5",
             request_id="req_message_determinism_second",
+            compress_responses_messages=True,
+            protect_recent=0,
         )
     )
 
@@ -394,6 +423,35 @@ def test_openai_responses_message_compression_is_byte_identical_across_cold_hand
     assert second_modified is True
     assert first_saved > 0
     assert second_saved == first_saved
+    assert first["input"][0]["content"][0]["text"] == repeated_line
+
+
+def test_openai_responses_protect_recent_zero_keeps_nonredundant_latest_message_byte_identical():
+    handler = _handler_with_router(ContentRouter())
+    latest_text = _long_message_text("non-redundant", segments=5)
+    payload = {
+        "model": "gpt-5",
+        "input": [_message_item("user", latest_text)],
+    }
+    original_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+
+    new_payload, modified, saved, transforms, units_by_category, _, attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            copy.deepcopy(payload),
+            model="gpt-5",
+            request_id="req_message_latest_noop",
+            compress_responses_messages=True,
+            protect_recent=0,
+        )
+    )
+
+    new_bytes = json.dumps(new_payload, ensure_ascii=False, separators=(",", ":")).encode()
+    assert new_bytes == original_bytes
+    assert modified is False
+    assert saved == 0
+    assert transforms == []
+    assert units_by_category == {"compressor_noop": 1}
+    assert attempted > 0
 
 
 def test_openai_responses_adapter_reuses_exact_tool_output_cache():
