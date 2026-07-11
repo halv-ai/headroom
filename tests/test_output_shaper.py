@@ -13,14 +13,15 @@ from headroom.proxy.output_shaper import (
     LEGACY_THINKING_FLOOR,
     OutputShaperSettings,
     TurnKind,
-    apply_responses_verbosity_steering,
+    apply_openai_responses_verbosity_steering,
     apply_verbosity_steering,
-    classify_responses_turn,
+    classify_openai_responses_input,
     classify_turn,
     route_effort,
-    route_responses_effort,
+    route_openai_reasoning_effort,
+    route_openai_text_verbosity,
+    shape_openai_responses_request,
     shape_request,
-    shape_responses_request,
     steering_text,
 )
 
@@ -288,42 +289,157 @@ class TestShapeRequest:
         assert settings.mechanical_effort == "low"
 
 
+class TestOpenAIResponsesClassify:
+    def test_string_input_is_new_ask(self):
+        assert classify_openai_responses_input("explain this") == TurnKind.NEW_USER_ASK
+
+    def test_function_call_output_only_is_mechanical(self):
+        input_data = [
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            }
+        ]
+        assert classify_openai_responses_input(input_data) == TurnKind.MECHANICAL_CONTINUATION
+
+    def test_mixed_user_message_and_tool_output_is_new_ask(self):
+        input_data = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "also check foo.py"}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ]
+        assert classify_openai_responses_input(input_data) == TurnKind.NEW_USER_ASK
+
+
+class TestOpenAIResponsesSteering:
+    def test_instructions_steering_is_idempotent_and_replaced(self):
+        body = {"instructions": f"System.\n\n{steering_text(1)}"}
+
+        assert apply_openai_responses_verbosity_steering(body, 2) is True
+        assert body["instructions"].count("<headroom_output_shaping>") == 1
+        assert steering_text(1) not in body["instructions"]
+        assert steering_text(2) in body["instructions"]
+
+        snapshot = copy.deepcopy(body)
+        assert apply_openai_responses_verbosity_steering(body, 2) is False
+        assert body == snapshot
+
+
+class TestOpenAIResponsesReasoning:
+    def test_reasoning_effort_lowers_only_for_mechanical_continuations(self):
+        body = {"reasoning": {"effort": "xhigh"}}
+        labels = route_openai_reasoning_effort(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            ENABLED,
+        )
+        assert labels == ["output_shaper:reasoning_effort:xhigh->low"]
+        assert body["reasoning"]["effort"] == "low"
+
+        new_ask = {"reasoning": {"effort": "xhigh"}}
+        assert route_openai_reasoning_effort(new_ask, TurnKind.NEW_USER_ASK, ENABLED) == []
+        assert new_ask["reasoning"]["effort"] == "xhigh"
+
+    def test_reasoning_effort_is_not_injected_when_absent(self):
+        body: dict[str, Any] = {}
+        labels = route_openai_reasoning_effort(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            ENABLED,
+        )
+        assert labels == []
+        assert "reasoning" not in body
+
+
+class TestOpenAIResponsesTextVerbosity:
+    def test_text_verbosity_set_for_gpt5_family(self):
+        body = {"model": "gpt-5.1"}
+        labels = route_openai_text_verbosity(body)
+        assert labels == ["output_shaper:text_verbosity:unset->low"]
+        assert body["text"] == {"verbosity": "low"}
+
+    def test_text_verbosity_not_injected_for_non_gpt5(self):
+        body = {"model": "gpt-4o"}
+        assert route_openai_text_verbosity(body) == []
+        assert "text" not in body
+
+    def test_existing_text_verbosity_is_lowered_for_any_model(self):
+        body = {"model": "gpt-4o", "text": {"verbosity": "medium"}}
+        labels = route_openai_text_verbosity(body)
+        assert labels == ["output_shaper:text_verbosity:medium->low"]
+        assert body["text"]["verbosity"] == "low"
+
+    def test_shape_openai_responses_combines_steering_native_knobs(self):
+        body = {
+            "model": "gpt-5",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                }
+            ],
+            "instructions": "System.",
+            "reasoning": {"effort": "xhigh"},
+            "text": {"verbosity": "medium"},
+        }
+        result = shape_openai_responses_request(body, ENABLED)
+
+        assert result.changed is True
+        assert result.labels == [
+            "output_shaper:verbosity:L2",
+            "output_shaper:reasoning_effort:xhigh->low",
+            "output_shaper:text_verbosity:medium->low",
+        ]
+        assert steering_text(2) in body["instructions"]
+        assert body["reasoning"]["effort"] == "low"
+        assert body["text"]["verbosity"] == "low"
+
+
 # ---------------------------------------------------------------------------
-# Responses output shaping
+# Fork Responses assertions on the upstream v0.31 APIs
 # ---------------------------------------------------------------------------
 
 
-class TestResponsesVerbositySteering:
+class TestOpenAIResponsesForkSteering:
     def test_missing_instructions_creates_steering_string(self):
         body: dict[str, Any] = {}
-        assert apply_responses_verbosity_steering(body, 2) is True
+        assert apply_openai_responses_verbosity_steering(body, 2) is True
         assert body["instructions"] == steering_text(2)
 
     def test_appends_to_instruction_tail_and_is_idempotent(self):
         body = {"instructions": "Keep answers short."}
-        assert apply_responses_verbosity_steering(body, 2) is True
+        assert apply_openai_responses_verbosity_steering(body, 2) is True
         snapshot = copy.deepcopy(body)
         assert body["instructions"] == f"Keep answers short.\n\n{steering_text(2)}"
-        assert apply_responses_verbosity_steering(body, 2) is False
+        assert apply_openai_responses_verbosity_steering(body, 2) is False
         assert body == snapshot
 
     def test_level_change_replaces_sentinel_in_place(self):
         body = {"instructions": "Keep answers short."}
-        apply_responses_verbosity_steering(body, 2)
-        assert apply_responses_verbosity_steering(body, 4) is True
+        apply_openai_responses_verbosity_steering(body, 2)
+        assert apply_openai_responses_verbosity_steering(body, 4) is True
         assert body["instructions"] == f"Keep answers short.\n\n{steering_text(4)}"
         assert body["instructions"].count("<headroom_output_shaping>") == 1
 
     def test_non_string_instructions_are_untouched(self):
         body = {"instructions": [{"type": "text", "text": "Sys."}]}
-        assert apply_responses_verbosity_steering(body, 2) is False
+        assert apply_openai_responses_verbosity_steering(body, 2) is False
         assert body == {"instructions": [{"type": "text", "text": "Sys."}]}
 
 
-class TestResponsesEffortRouting:
-    def test_latest_tool_output_is_mechanical(self):
+class TestOpenAIResponsesForkEffortRouting:
+    def test_tool_output_is_mechanical(self):
         assert (
-            classify_responses_turn(
+            classify_openai_responses_input(
                 [{"type": "function_call_output", "call_id": "c1", "output": "ok"}]
             )
             == TurnKind.MECHANICAL_CONTINUATION
@@ -331,34 +447,66 @@ class TestResponsesEffortRouting:
 
     def test_user_message_is_new_ask(self):
         assert (
-            classify_responses_turn(
-                [{"type": "message", "role": "user", "content": [{"type": "input_text"}]}]
+            classify_openai_responses_input(
+                [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "design a cache layer"}],
+                    }
+                ]
             )
             == TurnKind.NEW_USER_ASK
         )
 
-    def test_lowers_reasoning_effort_one_level_on_mechanical_turn(self):
+    def test_lowers_reasoning_effort_to_configured_target(self):
+        settings = OutputShaperSettings(enabled=True, mechanical_effort="medium")
         body = {"reasoning": {"effort": "high"}}
-        labels = route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION)
+        labels = route_openai_reasoning_effort(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            settings,
+        )
         assert body["reasoning"]["effort"] == "medium"
-        assert labels == ["output_shaper:responses_effort:high->medium"]
+        assert labels == ["output_shaper:reasoning_effort:high->medium"]
 
     def test_never_injects_reasoning_when_absent(self):
         body: dict[str, Any] = {}
-        assert route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION) == []
+        assert (
+            route_openai_reasoning_effort(
+                body,
+                TurnKind.MECHANICAL_CONTINUATION,
+                ENABLED,
+            )
+            == []
+        )
         assert "reasoning" not in body
 
     def test_never_raises_effort_or_changes_new_ask(self):
         body = {"reasoning": {"effort": "low"}}
-        assert route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION) == []
+        assert (
+            route_openai_reasoning_effort(
+                body,
+                TurnKind.MECHANICAL_CONTINUATION,
+                ENABLED,
+            )
+            == []
+        )
         assert body["reasoning"]["effort"] == "low"
 
         new_ask_body = {"reasoning": {"effort": "high"}}
-        assert route_responses_effort(new_ask_body, TurnKind.NEW_USER_ASK) == []
+        assert (
+            route_openai_reasoning_effort(
+                new_ask_body,
+                TurnKind.NEW_USER_ASK,
+                ENABLED,
+            )
+            == []
+        )
         assert new_ask_body["reasoning"]["effort"] == "high"
 
 
-class TestShapeResponsesRequest:
+class TestShapeOpenAIResponsesForkAssertions:
     def test_disabled_is_noop(self):
         body = {
             "instructions": "Sys.",
@@ -366,22 +514,23 @@ class TestShapeResponsesRequest:
             "reasoning": {"effort": "high"},
         }
         snapshot = copy.deepcopy(body)
-        result = shape_responses_request(body, OutputShaperSettings(enabled=False))
+        result = shape_openai_responses_request(body, OutputShaperSettings(enabled=False))
         assert result.changed is False
         assert body == snapshot
 
-    def test_enabled_applies_steering_and_effort_routing(self):
+    def test_enabled_applies_steering_and_effort_without_changing_output_cap(self):
+        settings = OutputShaperSettings(enabled=True, mechanical_effort="medium")
         body = {
             "instructions": "Sys.",
             "input": [{"type": "function_call_output", "call_id": "c1", "output": "ok"}],
             "reasoning": {"effort": "high"},
             "max_output_tokens": 4096,
         }
-        result = shape_responses_request(body, ENABLED)
+        result = shape_openai_responses_request(body, settings)
         assert result.changed is True
         assert result.labels == [
             "output_shaper:verbosity:L2",
-            "output_shaper:responses_effort:high->medium",
+            "output_shaper:reasoning_effort:high->medium",
         ]
         assert body["instructions"] == f"Sys.\n\n{steering_text(2)}"
         assert body["reasoning"]["effort"] == "medium"
@@ -393,7 +542,7 @@ class TestShapeResponsesRequest:
             "input": [{"type": "message", "role": "user", "content": "design a cache layer"}],
             "reasoning": {"effort": "high"},
         }
-        result = shape_responses_request(body, ENABLED)
+        result = shape_openai_responses_request(body, ENABLED)
         assert result.labels == ["output_shaper:verbosity:L2"]
         assert body["reasoning"]["effort"] == "high"
 
@@ -402,8 +551,8 @@ class TestShapeResponsesRequest:
             "instructions": "Sys.",
             "input": [{"type": "function_call_output", "call_id": "c1", "output": "ok"}],
         }
-        shape_responses_request(body, ENABLED)
+        shape_openai_responses_request(body, ENABLED)
         snapshot = copy.deepcopy(body)
-        result = shape_responses_request(body, ENABLED)
+        result = shape_openai_responses_request(body, ENABLED)
         assert result.changed is False
         assert body == snapshot
