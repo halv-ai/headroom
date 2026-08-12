@@ -217,6 +217,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
             retry_base_delay_ms=10,
             retry_max_delay_ms=50,
             connect_timeout_seconds=10,
+            openai_extra_headers=None,
         )
         self.usage_reporter = None
         self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 128_000)
@@ -224,6 +225,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.anthropic_backend = None
         self.cost_tracker = None
         self.memory_handler = None
+        self.traffic_learner = None
         # PR-A6 wires session-sticky `OpenAI-Beta` merging into the
         # responses HTTP handler — it reads `compute_session_id` to key
         # the SessionBetaTracker. The routing tests don't exercise the
@@ -251,6 +253,14 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         # a wall-clock timeout; tests just need the callable invoked
         # synchronously so MagicMock call_count assertions fire.
         return fn()
+
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        # Test stub for HeadroomProxy._count_tokens_offloaded: resolve the
+        # tokenizer and count inline (the real method offloads to the executor).
+        from headroom.tokenizers import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+        return tokenizer, tokenizer.count_messages(messages)
 
     async def _record_request_outcome(self, outcome) -> None:
         # Test stub: delegates to the production funnel so wire shape
@@ -285,6 +295,33 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
             body=body,
             memory_user_id=memory_user_id,
         )
+
+
+class _MemoryToolsOnlyHandler:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            inject_context=False,
+            inject_tools=True,
+            project_root_override="",
+        )
+        self.compute_calls = 0
+
+    def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+        self.compute_calls += 1
+        assert provider == "openai"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "Search memory.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    def has_memory_tool_calls(self, response: dict, provider: str) -> bool:
+        return False
 
 
 def _build_request(body: dict, headers: dict[str, str]) -> Request:
@@ -460,6 +497,7 @@ def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch)
     assert url == "https://chatgpt.com/backend-api/codex/responses"
     assert headers["ChatGPT-Account-ID"] == "acct-from-jwt"
     assert body["input"] == "hello"
+    assert body["store"] is False
     assert response.status_code == 200
 
 
@@ -496,6 +534,38 @@ def test_handle_openai_responses_strips_codex_lite_header_upstream(monkeypatch):
     assert lowered.get("x-openai-debug") == "keep-me"
 
 
+def test_handle_openai_responses_chatgpt_auth_skips_memory_tools(monkeypatch):
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-jwt",
+            }
+        }
+    )
+    request = _build_request(
+        {"model": "gpt-5.4", "input": "hello", "store": True},
+        {"Authorization": f"Bearer {token}", "x-headroom-user-id": "user-1"},
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-chatgpt-no-memory-tools",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, _, body = handler.captured_request
+    assert url == "https://chatgpt.com/backend-api/codex/responses"
+    assert body["store"] is False
+    assert "tools" not in body
+    assert memory_handler.compute_calls == 0
+
+
 def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     token = _jwt(
         {
@@ -525,6 +595,32 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     assert method == "POST"
     assert url == "https://chatgpt.com/backend-api/codex/responses"
     assert body["input"] == "large context"
+    assert body["store"] is False
+
+
+def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello", "store": False},
+        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-api-memory-tools",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, _, body = handler.captured_request
+    assert url == "https://api.openai.com/v1/responses"
+    assert body["store"] is False
+    assert "tools" not in body
+    assert memory_handler.compute_calls == 1
 
 
 def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatch):
@@ -545,9 +641,11 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     assert headers.get("ChatGPT-Account-ID") is None
     assert body["input"] == "hello"
     assert response.status_code == 200
-    assert handler.recorded_outcomes[-1].original_tokens == 2
-    assert handler.recorded_outcomes[-1].optimized_tokens == 2
-    assert handler.recorded_outcomes[-1].tokens_saved == 0
+    outcome = handler.recorded_outcomes[-1]
+    assert outcome.original_tokens == 1
+    assert outcome.optimized_tokens == 1
+    assert outcome.provider_input_tokens == 2
+    assert outcome.tokens_saved == 0
 
 
 def test_handle_openai_responses_internal_compression_headers_override_config_and_are_stripped(
@@ -719,7 +817,6 @@ def test_handle_openai_responses_message_savings_reach_metrics_log_and_cost_once
         handler,
         handler.metrics,
         {},
-        0,
         outcome.original_tokens,
     )
     assert session_summary["compression"]["requests_compressed"] == 1
