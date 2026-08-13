@@ -2703,6 +2703,7 @@ class OpenAIHandlerMixin:
         compress_responses_messages: bool = False,
         protect_recent: int | None = None,
         client: str | None = None,
+        preserve_tools: bool = False,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2755,38 +2756,40 @@ class OpenAIHandlerMixin:
         transforms: list[str] = []
         reason: str | None = None
 
-        tool_compaction_started = time.perf_counter()
-        compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
-            _compact_openai_responses_tools(working)
-        )
-        _add_timing("compression_tool_schema_compaction", tool_compaction_started)
-        if tools_modified:
-            working = compacted_payload
-            modified = True
-            reason = None
-            transforms.append("openai:responses:tool_schema_compaction")
-            try:
-                tool_token_started = time.perf_counter()
-                tokenizer = self.openai_provider.get_token_counter(model)
-                tokens_saved += max(
-                    0,
-                    tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
-                    - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
-                )
-                _add_timing("compression_tool_schema_token_count", tool_token_started)
-            except Exception:
-                pass
-            if debug_enabled:
-                _log_codex_compression_debug(
-                    "codex_tool_schema_compaction",
-                    request_id=request_id,
-                    pass_id=pass_id,
-                    model=model,
-                    modified=True,
-                    tools_bytes_before=tools_before_bytes,
-                    tools_bytes_after=tools_after_bytes,
-                    tools_bytes_saved=tools_before_bytes - tools_after_bytes,
-                )
+        tools_modified = False
+        if not preserve_tools:
+            tool_compaction_started = time.perf_counter()
+            compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
+                _compact_openai_responses_tools(working)
+            )
+            _add_timing("compression_tool_schema_compaction", tool_compaction_started)
+            if tools_modified:
+                working = compacted_payload
+                modified = True
+                reason = None
+                transforms.append("openai:responses:tool_schema_compaction")
+                try:
+                    tool_token_started = time.perf_counter()
+                    tokenizer = self.openai_provider.get_token_counter(model)
+                    tokens_saved += max(
+                        0,
+                        tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
+                        - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
+                    )
+                    _add_timing("compression_tool_schema_token_count", tool_token_started)
+                except Exception:
+                    pass
+                if debug_enabled:
+                    _log_codex_compression_debug(
+                        "codex_tool_schema_compaction",
+                        request_id=request_id,
+                        pass_id=pass_id,
+                        model=model,
+                        modified=True,
+                        tools_bytes_before=tools_before_bytes,
+                        tools_bytes_after=tools_after_bytes,
+                        tools_bytes_saved=tools_before_bytes - tools_after_bytes,
+                    )
 
         # Layer 2: Tool description truncation (opt-in via
         # HEADROOM_TOOL_DESC_MAX_CHARS).
@@ -2797,7 +2800,7 @@ class OpenAIHandlerMixin:
             )
 
             _desc_max = tool_desc_max_chars()
-            if _desc_max > 0:
+            if not preserve_tools and _desc_max > 0:
                 _desc_compact_started = time.perf_counter()
                 desc_payload, desc_modified, desc_before, desc_after = compact_tool_descriptions(
                     working, _desc_max
@@ -2840,15 +2843,16 @@ class OpenAIHandlerMixin:
         # one — hence a transform tag but no tokens_saved claim.
         from headroom.proxy.helpers import inject_tool_search_deferral_openai
 
-        _deferred_tools = inject_tool_search_deferral_openai(
-            working.get("tools"), model, client=client
-        )
-        if _deferred_tools is not working.get("tools"):
-            if working is payload:
-                working = copy.deepcopy(payload)
-            working["tools"] = _deferred_tools
-            modified = True
-            transforms.append("openai:responses:tool_search_deferral")
+        if not preserve_tools:
+            _deferred_tools = inject_tool_search_deferral_openai(
+                working.get("tools"), model, client=client
+            )
+            if _deferred_tools is not working.get("tools"):
+                if working is payload:
+                    working = copy.deepcopy(payload)
+                working["tools"] = _deferred_tools
+                modified = True
+                transforms.append("openai:responses:tool_search_deferral")
 
         # Turn hooks (opt-in extensions): a registered hook may inspect or rewrite
         # the outbound tools before we send — the extensible counterpart to the
@@ -2885,11 +2889,13 @@ class OpenAIHandlerMixin:
                 provider="openai",
                 model=str(model),
                 messages=_msgs_before,
-                tools=working.get("tools"),
+                tools=(
+                    copy.deepcopy(working.get("tools")) if preserve_tools else working.get("tools")
+                ),
                 config=getattr(self, "config", None),
             )
             run_request_hooks(_req_ctx)
-            if _req_ctx.tools is not working.get("tools"):
+            if not preserve_tools and _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
             # A hook may also fold the messages (replace or in-place). Write back a
             # replaced list — previously dropped on this path — then re-count so the
@@ -3048,6 +3054,7 @@ class OpenAIHandlerMixin:
         protect_recent: int | None = None,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
+        preserve_tools: bool = False,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
         compression_kwargs: dict[str, Any] = {
@@ -3059,6 +3066,8 @@ class OpenAIHandlerMixin:
         }
         if protect_recent is not None:
             compression_kwargs["protect_recent"] = protect_recent
+        if preserve_tools:
+            compression_kwargs["preserve_tools"] = True
 
         def _compress():  # noqa: ANN202
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
@@ -3084,6 +3093,7 @@ class OpenAIHandlerMixin:
                             name
                             for name in (
                                 "client",
+                                "preserve_tools",
                                 "timing",
                                 "protect_recent",
                                 "compress_responses_messages",
@@ -7215,6 +7225,7 @@ class OpenAIHandlerMixin:
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
                                 client=client,
+                                preserve_tools=client == "codex",
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -7531,6 +7542,7 @@ class OpenAIHandlerMixin:
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
                                     client=client,
+                                    preserve_tools=client == "codex",
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)

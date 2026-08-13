@@ -346,6 +346,38 @@ def _redundant_response_create_frame() -> str:
     )
 
 
+def _scip_tools() -> list[dict]:
+    tool_names = ["scip_index", "scip_find", "scip_map", "scip_outline", "scip_expand"]
+    return [
+        {
+            "type": "function",
+            "name": name,
+            "description": "  Find symbols with the SCIP index.\nPreserve this text.  ",
+            "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "title": f"{name}Parameters",
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "title": "Query",
+                        "type": "string",
+                        "examples": ["HeadroomProxy"],
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
+        for name in tool_names
+    ]
+
+
+def _redundant_response_create_frame_with_tools() -> str:
+    frame = json.loads(_redundant_response_create_frame())
+    frame["response"]["tools"] = _scip_tools()
+    return json.dumps(frame)
+
+
 def _codex_lite_headers(*, chatgpt: bool) -> dict[str, str]:
     headers = {
         "authorization": "Bearer test",
@@ -506,7 +538,7 @@ async def test_ws_output_shaper_holdout_labels_without_rewrite(monkeypatch):
 @pytest.mark.asyncio
 async def test_ws_response_create_compresses_and_records_shared_savings_once(monkeypatch):
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
-    original_frame = _redundant_response_create_frame()
+    original_frame = _redundant_response_create_frame_with_tools()
     upstream_events = [
         json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
         json.dumps(
@@ -541,6 +573,14 @@ async def test_ws_response_create_compresses_and_records_shared_savings_once(mon
         forwarded["response"]["input"][0]["content"][0]["text"]
         != original["response"]["input"][0]["content"][0]["text"]
     )
+    assert forwarded["response"]["tools"] == original["response"]["tools"]
+    assert [tool["name"] for tool in forwarded["response"]["tools"]] == [
+        "scip_index",
+        "scip_find",
+        "scip_map",
+        "scip_outline",
+        "scip_expand",
+    ]
     assert handler.metrics.codex_ws_frames[0]["tokens_saved"] > 0
     assert len(handler.metrics.codex_ws_frames) == 1
     assert len(handler.metrics.recorded_requests) == 1
@@ -660,7 +700,7 @@ async def test_ws_later_response_create_frame_uses_shared_compression(monkeypatc
 @pytest.mark.asyncio
 async def test_ws_other_input_frame_uses_frame_header_overrides(monkeypatch):
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
-    response_frame = json.loads(_redundant_response_create_frame())["response"]
+    response_frame = json.loads(_redundant_response_create_frame_with_tools())["response"]
     later_frame = json.dumps(
         {
             "type": "request.update",
@@ -695,6 +735,7 @@ async def test_ws_other_input_frame_uses_frame_header_overrides(monkeypatch):
 
     forwarded = json.loads(upstream.sent[-1])
     assert forwarded["type"] == "request.update"
+    assert forwarded["tools"] == response_frame["tools"]
     assert upstream.sent[-1] != later_frame
     assert handler.metrics.codex_ws_frames[-1]["tokens_saved"] > 0
 
@@ -746,6 +787,7 @@ async def test_ws_first_frame_compression_uses_bounded_executor(monkeypatch):
         handler._compress_openai_responses_payload.call_args.kwargs["compress_responses_messages"]
         is True
     )
+    assert handler._compress_openai_responses_payload.call_args.kwargs["preserve_tools"] is True
 
 
 @pytest.mark.asyncio
