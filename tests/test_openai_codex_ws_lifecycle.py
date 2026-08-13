@@ -20,6 +20,7 @@ import pytest
 import headroom.proxy.handlers.openai as openai_module
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
+from headroom.transforms.content_router import ContentRouter
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -317,6 +318,34 @@ def _first_frame() -> str:
     )
 
 
+def _redundant_response_create_frame() -> str:
+    repeated_line = (
+        "The WebSocket request repeats this exact sentence for deterministic "
+        "compression while preserving the useful request."
+    )
+    repeated_text = "\n".join([repeated_line] * 12)
+    return json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": repeated_text}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": repeated_text}],
+                    },
+                ],
+            },
+        }
+    )
+
+
 def _codex_lite_headers(*, chatgpt: bool) -> dict[str, str]:
     headers = {
         "authorization": "Bearer test",
@@ -475,6 +504,202 @@ async def test_ws_output_shaper_holdout_labels_without_rewrite(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ws_response_create_compresses_and_records_shared_savings_once(monkeypatch):
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    original_frame = _redundant_response_create_frame()
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {"input_tokens": 200, "output_tokens": 3},
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    client_ws = _FakeWebSocket(
+        frames=[original_frame],
+        headers={
+            "authorization": "Bearer test",
+            "X-Headroom-Compress-Messages": "true",
+            "X-Headroom-Protect-Recent": "0",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline = SimpleNamespace(transforms=[ContentRouter()])
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    forwarded = json.loads(upstream.sent[0])
+    original = json.loads(original_frame)
+    assert (
+        forwarded["response"]["input"][0]["content"][0]["text"]
+        != original["response"]["input"][0]["content"][0]["text"]
+    )
+    assert handler.metrics.codex_ws_frames[0]["tokens_saved"] > 0
+    assert len(handler.metrics.codex_ws_frames) == 1
+    assert len(handler.metrics.recorded_requests) == 1
+    shared_record = handler.metrics.recorded_requests[0]
+    assert shared_record["tokens_saved"] == handler.metrics.codex_ws_frames[0]["tokens_saved"]
+
+
+@pytest.mark.asyncio
+async def test_ws_response_create_is_byte_identical_when_compression_is_disabled(
+    caplog,
+    monkeypatch,
+):
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    original_frame = _redundant_response_create_frame()
+    upstream = _FakeUpstream(
+        [json.dumps({"type": "response.completed", "response": {"id": "r_1"}})]
+    )
+    client_ws = _FakeWebSocket(frames=[original_frame])
+    handler = _DummyOpenAIHandler()
+    caplog.set_level(logging.INFO, logger="headroom.proxy")
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert upstream.sent[0] == original_frame
+    assert "reason=disabled" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ws_response_create_without_eligible_content_is_byte_identical(
+    caplog,
+    monkeypatch,
+):
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    original_frame = _first_frame()
+    upstream = _FakeUpstream(
+        [json.dumps({"type": "response.completed", "response": {"id": "r_1"}})]
+    )
+    client_ws = _FakeWebSocket(frames=[original_frame])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline = SimpleNamespace(transforms=[ContentRouter()])
+    caplog.set_level(logging.INFO, logger="headroom.proxy")
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert upstream.sent[0] == original_frame
+    assert "reason=nothing_eligible" in caplog.text
+    assert "reason=router_no_compression" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ws_response_create_error_rolls_back_to_original_frame(caplog, monkeypatch):
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    original_frame = _redundant_response_create_frame()
+    upstream = _FakeUpstream(
+        [json.dumps({"type": "response.completed", "response": {"id": "r_1"}})]
+    )
+    client_ws = _FakeWebSocket(frames=[original_frame])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+
+    def _raise_after_mutation(payload, **_kwargs):
+        payload.clear()
+        raise RuntimeError("simulated transform failure")
+
+    handler._compress_openai_responses_payload = _raise_after_mutation  # type: ignore[method-assign]
+    caplog.set_level(logging.INFO, logger="headroom.proxy")
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert upstream.sent[0] == original_frame
+    assert "reason=error_rollback" in caplog.text
+    assert len(handler.metrics.codex_ws_frames) == 1
+    assert handler.metrics.codex_ws_frames[0]["failed"] is True
+
+
+@pytest.mark.asyncio
+async def test_ws_later_response_create_frame_uses_shared_compression(monkeypatch):
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    later_frame = _redundant_response_create_frame()
+    upstream = _FakeUpstream([], hold_after_events=True)
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), later_frame],
+        headers={
+            "authorization": "Bearer test",
+            "X-Headroom-Compress-Messages": "true",
+            "X-Headroom-Protect-Recent": "0",
+        },
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline = SimpleNamespace(transforms=[ContentRouter()])
+
+    async def _disconnect() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        trigger = asyncio.create_task(_disconnect())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await trigger
+
+    assert upstream.sent[-1] != later_frame
+    forwarded = json.loads(upstream.sent[-1])
+    assert forwarded["type"] == "response.create"
+    assert handler.metrics.codex_ws_frames[-1]["tokens_saved"] > 0
+
+
+@pytest.mark.asyncio
+async def test_ws_other_input_frame_uses_frame_header_overrides(monkeypatch):
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    response_frame = json.loads(_redundant_response_create_frame())["response"]
+    later_frame = json.dumps(
+        {
+            "type": "request.update",
+            "headers": {
+                "X-Headroom-Compress-Messages": "true",
+                "X-Headroom-Protect-Recent": "0",
+            },
+            **response_frame,
+        }
+    )
+    upstream = _FakeUpstream([], hold_after_events=True)
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), later_frame],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline = SimpleNamespace(transforms=[ContentRouter()])
+
+    async def _disconnect() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        trigger = asyncio.create_task(_disconnect())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await trigger
+
+    forwarded = json.loads(upstream.sent[-1])
+    assert forwarded["type"] == "request.update"
+    assert upstream.sent[-1] != later_frame
+    assert handler.metrics.codex_ws_frames[-1]["tokens_saved"] > 0
+
+
+@pytest.mark.asyncio
 async def test_ws_first_frame_compression_uses_bounded_executor(monkeypatch):
     """Codex WS compression must not run synchronously on the event loop."""
     upstream_events = [
@@ -524,8 +749,8 @@ async def test_ws_first_frame_compression_uses_bounded_executor(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ws_first_frame_timeout_uses_timeout_reason(caplog, monkeypatch):
-    """Codex WS compression timeout must stay bounded and visible."""
+async def test_ws_first_frame_timeout_uses_error_rollback_reason(caplog, monkeypatch):
+    """A Codex WS timeout must stay bounded and roll back safely."""
     upstream_events = [
         json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
         json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
@@ -556,15 +781,15 @@ async def test_ws_first_frame_timeout_uses_timeout_reason(caplog, monkeypatch):
         await handler.handle_openai_responses_ws(client_ws)
 
     assert handler.compression_executor_timeouts == [0.01]
-    assert "reason=compression_timeout" in caplog.text
+    assert "reason=error_rollback" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_ws_first_frame_non_timeout_exception_keeps_generic_reason(
+async def test_ws_first_frame_non_timeout_exception_uses_error_rollback_reason(
     caplog,
     monkeypatch,
 ):
-    """Codex WS non-timeout compression failures still log the generic reason."""
+    """A non-timeout compression failure must log an error rollback."""
     upstream_events = [
         json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
         json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
@@ -595,7 +820,7 @@ async def test_ws_first_frame_non_timeout_exception_keeps_generic_reason(
         await handler.handle_openai_responses_ws(client_ws)
 
     assert handler.compression_executor_timeouts == [0.01]
-    assert "reason=compression_exception" in caplog.text
+    assert "reason=error_rollback" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -656,7 +881,7 @@ async def test_ws_later_frame_timeout_records_failed_frame(caplog, monkeypatch):
     assert handler.compression_executor_timeouts == [0.01, 0.01]
     assert upstream.sent[-1] == second_frame
     assert failed_frames and failed_frames[-1]["elapsed_ms"] > 0
-    assert "reason=compression_timeout" in caplog.text
+    assert "reason=error_rollback" in caplog.text
 
 
 @pytest.mark.asyncio

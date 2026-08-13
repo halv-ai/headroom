@@ -1479,6 +1479,56 @@ def _headroom_protect_recent(
     return default
 
 
+def _openai_responses_ws_frame_payload(
+    frame: Any,
+) -> tuple[dict[str, Any], bool] | None:
+    """Return a request payload and its envelope state for a client WS frame."""
+
+    if not isinstance(frame, dict):
+        return None
+    wrapped = isinstance(frame.get("response"), dict)
+    payload = frame["response"] if wrapped else frame
+    if not isinstance(payload, dict):
+        return None
+    if frame.get("type") == "response.create":
+        return payload, wrapped
+    if "type" not in frame and "input" in payload:
+        return payload, wrapped
+    if isinstance(payload.get("input"), list):
+        return payload, wrapped
+    return None
+
+
+def _openai_responses_ws_frame_compression_options(
+    frame: dict[str, Any],
+    payload: dict[str, Any],
+    connection_headers: Any,
+    *,
+    configured_protect_recent: Any = _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
+) -> tuple[bool, int | None]:
+    """Resolve connection headers, then apply frame header overrides."""
+
+    effective_headers: dict[str, Any] = {}
+    try:
+        effective_headers.update(
+            {str(key).lower(): value for key, value in connection_headers.items()}
+        )
+    except (AttributeError, TypeError):
+        pass
+    for container in (frame, payload):
+        frame_headers = container.get("headers")
+        if not isinstance(frame_headers, dict):
+            continue
+        effective_headers.update({str(key).lower(): value for key, value in frame_headers.items()})
+    compress_messages = _headroom_compress_messages_enabled(effective_headers)
+    protect_recent = (
+        _headroom_protect_recent(effective_headers, configured_protect_recent)
+        if _HEADROOM_PROTECT_RECENT_HEADER in effective_headers
+        else None
+    )
+    return compress_messages, protect_recent
+
+
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
@@ -6189,7 +6239,7 @@ class OpenAIHandlerMixin:
            immediately or API-key sessions after the upstream handshake
         2. Receives the first message (``response.create`` request)
         3. Opens an upstream WebSocket to OpenAI
-        4. Compresses eligible `response.create` text through the Python
+        4. Compresses eligible request-frame text through the Python
            ContentRouter path, then sends the request upstream
         5. Relays all subsequent messages bidirectionally
         """
@@ -6220,19 +6270,6 @@ class OpenAIHandlerMixin:
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
-        _ws_compress_responses_messages = _headroom_compress_messages_enabled(ws_headers)
-        _ws_protect_recent = (
-            _headroom_protect_recent(
-                ws_headers,
-                getattr(
-                    getattr(self, "config", None),
-                    "protect_recent",
-                    _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
-                ),
-            )
-            if _header_get(ws_headers, _HEADROOM_PROTECT_RECENT_HEADER) is not None
-            else None
-        )
         _ws_url_obj = getattr(websocket, "url", None)
         _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
         _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
@@ -6661,7 +6698,7 @@ class OpenAIHandlerMixin:
             # `response.create` frames through the shared Python
             # CompressionUnit + ContentRouter path before upstream send.
             # Subsequent client→upstream frames are now ALSO compressed
-            # via `_maybe_compress_response_create_frame` in
+            # via `_maybe_compress_responses_request_frame` in
             # `_client_to_upstream` so long-lived subscription Codex
             # sessions get savings on every turn, not just the first.
 
@@ -6813,6 +6850,24 @@ class OpenAIHandlerMixin:
                     if transform not in chain:
                         chain.append(transform)
                 return chain
+
+            def _record_ws_frame_diagnostic(**fields: Any) -> None:
+                record_frame = getattr(
+                    getattr(self, "metrics", None),
+                    "record_codex_ws_frame",
+                    None,
+                )
+                if record_frame is None:
+                    return
+                try:
+                    record_frame(**fields)
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] WS frame diagnostic failed: %s: %s",
+                        request_id,
+                        type(exc).__name__,
+                        exc,
+                    )
 
             def _current_ws_overhead_ms() -> float:
                 summary = stage_timer.summary()
@@ -7083,20 +7138,15 @@ class OpenAIHandlerMixin:
             ):
                 first_msg_raw = await _prepare_memory_frame(body, first_msg_raw)
 
-            # Hot-fix follow-up to PR #406 — inline Rust compression on the
-            # WS first frame before forwarding upstream. PR #406 enabled
-            # the same call for HTTP /v1/responses; PR-C5's "WS-side
-            # compression is a follow-up" note is closed here. Codex
-            # subscription users default to WebSocket transport for
-            # /v1/responses (proxy-confirmed via #409 reviewer testing),
-            # so without this call subscription traffic flows through
-            # Headroom uncompressed.
+            # Run the shared Responses compression pipeline before forwarding
+            # the first frame upstream. Codex subscription users default to
+            # WebSocket transport, so this path must match the HTTP path.
             #
             # The first frame may be either:
             #   • {"type": "response.create", "response": {...payload...}}
             #   • the payload directly (older shapes)
-            # We unwrap, compress the inner payload via the PyO3 dispatcher,
-            # and re-wrap so both shapes work.
+            # We unwrap and compress the inner payload. We then restore the
+            # original envelope so both shapes work.
             #
             # Re-parses from `first_msg_raw` rather than reusing `body`
             # because `body` may be partially mutated if memory injection
@@ -7105,8 +7155,10 @@ class OpenAIHandlerMixin:
             # upstream). The PyO3 binding never raises (passthrough on
             # internal errors), but we wrap the call site in try/except
             # anyway so a JSON-shape edge case can never break the WS
-            # session.
+            # session. A deep copy prevents a failed transform from mutating
+            # the frame that we forward during rollback.
             first_frame_rewritten = False
+            first_frame_error_rollback = False
             if self.config.optimize and not _ws_bypass:
                 _first_frame_compression_elapsed_ms = 0.0
                 try:
@@ -7117,12 +7169,23 @@ class OpenAIHandlerMixin:
                     except json.JSONDecodeError:
                         _send_body = None
 
-                    if isinstance(_send_body, dict):
-                        _wrapped = "response" in _send_body and isinstance(
-                            _send_body["response"], dict
-                        )
-                        _inner = _send_body["response"] if _wrapped else _send_body
+                    _selected_payload = _openai_responses_ws_frame_payload(_send_body)
+                    if _selected_payload is not None and isinstance(_send_body, dict):
+                        _inner, _wrapped = _selected_payload
                         _model = (_inner.get("model") if isinstance(_inner, dict) else None) or ""
+                        (
+                            _frame_compress_messages,
+                            _frame_protect_recent,
+                        ) = _openai_responses_ws_frame_compression_options(
+                            _send_body,
+                            _inner,
+                            ws_headers,
+                            configured_protect_recent=getattr(
+                                getattr(self, "config", None),
+                                "protect_recent",
+                                _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
+                            ),
+                        )
 
                         _preflight_ms = (time.perf_counter() - _preflight_started) * 1000.0
                         _record_ws_compression_timing(
@@ -7143,11 +7206,11 @@ class OpenAIHandlerMixin:
                                 _ws_attempted_tokens,
                                 _ws_compression_timing,
                             ) = await self._compress_openai_responses_payload_in_executor(
-                                _inner,
+                                copy.deepcopy(_inner),
                                 model=_model,
                                 request_id=request_id,
-                                compress_responses_messages=_ws_compress_responses_messages,
-                                protect_recent=_ws_protect_recent,
+                                compress_responses_messages=_frame_compress_messages,
+                                protect_recent=_frame_protect_recent,
                                 timeout=_codex_ws_compression_timeout_seconds()
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
@@ -7164,27 +7227,8 @@ class OpenAIHandlerMixin:
                                 _first_frame_compression_elapsed_ms,
                             )
                             _record_ws_compression_overhead(_first_frame_compression_elapsed_ms)
-                        record_frame = getattr(
-                            getattr(self, "metrics", None), "record_codex_ws_frame", None
-                        )
-                        if record_frame is not None:
-                            record_frame(
-                                elapsed_ms=_first_frame_compression_elapsed_ms,
-                                bytes_before=_bytes_before,
-                                bytes_after=_bytes_after,
-                                attempted_tokens=_ws_attempted_tokens,
-                                tokens_saved=_ws_saved,
-                                modified=_modified,
-                                strategy_chain=_codex_ws_strategy_chain(_ws_transforms),
-                                final_strategies=_codex_ws_final_strategies(_ws_compression_timing),
-                            )
-                        # Record transform labels even when the frame bytes are
-                        # unchanged: control-arm output-shaper labels
-                        # (output_shaper:control:*) must reach the outcome
-                        # ledger for A/B baseline accounting.
-                        for _t in _ws_transforms:
-                            if _t not in transforms_applied:
-                                transforms_applied.append(_t)
+                        if _modified and not isinstance(_new_inner, dict):
+                            raise TypeError("WS compression returned a non-object payload")
                         if _modified:
                             if isinstance(_new_inner, dict):
                                 _rewrite_started = time.perf_counter()
@@ -7199,6 +7243,21 @@ class OpenAIHandlerMixin:
                                     _rewrite_ms,
                                 )
                                 _record_ws_compression_overhead(_rewrite_ms)
+                                _record_ws_frame_diagnostic(
+                                    elapsed_ms=_first_frame_compression_elapsed_ms,
+                                    bytes_before=_bytes_before,
+                                    bytes_after=_bytes_after,
+                                    attempted_tokens=_ws_attempted_tokens,
+                                    tokens_saved=_ws_saved,
+                                    modified=True,
+                                    strategy_chain=_codex_ws_strategy_chain(_ws_transforms),
+                                    final_strategies=_codex_ws_final_strategies(
+                                        _ws_compression_timing
+                                    ),
+                                )
+                                for _t in _ws_transforms:
+                                    if _t not in transforms_applied:
+                                        transforms_applied.append(_t)
                                 tokens_saved += int(_ws_saved)
                                 attempted_input_tokens_total += int(_ws_attempted_tokens)
                                 logger.info(
@@ -7215,8 +7274,23 @@ class OpenAIHandlerMixin:
                                 ws_frames_compressed += 1
                                 first_frame_rewritten = True
                         else:
+                            _record_ws_frame_diagnostic(
+                                elapsed_ms=_first_frame_compression_elapsed_ms,
+                                bytes_before=_bytes_before,
+                                bytes_after=_bytes_after,
+                                attempted_tokens=_ws_attempted_tokens,
+                                tokens_saved=_ws_saved,
+                                modified=False,
+                                strategy_chain=_codex_ws_strategy_chain(_ws_transforms),
+                                final_strategies=_codex_ws_final_strategies(_ws_compression_timing),
+                            )
+                            # Control-arm labels must reach the outcome ledger,
+                            # even when the frame bytes stay unchanged.
+                            for _t in _ws_transforms:
+                                if _t not in transforms_applied:
+                                    transforms_applied.append(_t)
                             _log_ws_passthrough(
-                                _ws_reason or "no_compression",
+                                "nothing_eligible",
                                 frame_index=1,
                                 raw_bytes=_bytes_before,
                                 frame_type=str(_send_body.get("type") or "response.create"),
@@ -7224,23 +7298,24 @@ class OpenAIHandlerMixin:
                             )
                     else:
                         _log_ws_passthrough(
-                            "first_frame_non_json",
+                            "nothing_eligible",
                             frame_index=1,
                             raw_bytes=len(first_msg_raw.encode("utf-8", errors="replace")),
-                            frame_type="unknown",
+                            frame_type=(
+                                str(_send_body.get("type") or "unknown")
+                                if isinstance(_send_body, dict)
+                                else "unknown"
+                            ),
                         )
                 except Exception as _ce:
+                    first_frame_error_rollback = True
                     _ws_frame_bytes = len(first_msg_raw.encode("utf-8", errors="replace"))
                     if _first_frame_compression_elapsed_ms > 0:
-                        record_frame = getattr(
-                            getattr(self, "metrics", None), "record_codex_ws_frame", None
+                        _record_ws_frame_diagnostic(
+                            elapsed_ms=_first_frame_compression_elapsed_ms,
+                            bytes_before=_ws_frame_bytes,
+                            failed=True,
                         )
-                        if record_frame is not None:
-                            record_frame(
-                                elapsed_ms=_first_frame_compression_elapsed_ms,
-                                bytes_before=_ws_frame_bytes,
-                                failed=True,
-                            )
                     _timeout_failure = isinstance(_ce, asyncio.TimeoutError)
                     logger.warning(
                         f"[{request_id}] WS /v1/responses compression "
@@ -7248,7 +7323,7 @@ class OpenAIHandlerMixin:
                         f"(bytes={_ws_frame_bytes}): {type(_ce).__name__}: {_ce}"
                     )
                     _log_ws_passthrough(
-                        "compression_timeout" if _timeout_failure else "compression_exception",
+                        "error_rollback",
                         frame_index=1,
                         raw_bytes=_ws_frame_bytes,
                         frame_type="response.create" if body else "unknown",
@@ -7256,53 +7331,9 @@ class OpenAIHandlerMixin:
                         if isinstance(body, dict)
                         else "unknown",
                     )
-                    # Fail-closed protection (default): refuse to forward
-                    # oversized frames after a compression failure. Forwarding
-                    # the original to the upstream would cause a
-                    # context-window-exceeded response that the client
-                    # (e.g. Codex) cannot recover from, because Headroom's
-                    # earlier successful compressions hid the cumulative
-                    # context pressure from the client's auto-compaction
-                    # heuristic. Close the client WS with 1009 instead so the
-                    # client gets a clear "compact and retry" signal.
-                    # See helpers.decide_compression_failure_action for the
-                    # decision matrix and env-var overrides.
-                    from headroom.proxy.helpers import (
-                        decide_compression_failure_action,
-                    )
-
-                    _ws_action = decide_compression_failure_action(
-                        _ce,
-                        _ws_frame_bytes,
-                        client=client,
-                    )
-                    if _ws_action.refuse:
-                        logger.error(
-                            "[%s] WS /v1/responses REFUSING to forward "
-                            "frame after compression failure "
-                            "(reason=%s, bytes=%d); closing client "
-                            "websocket with 1009 so client can compact "
-                            "context and retry. To restore legacy "
-                            "passthrough behaviour set "
-                            "HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE=1.",
-                            request_id,
-                            _ws_action.reason,
-                            _ws_action.frame_bytes,
-                        )
-                        termination_cause = "compression_refused"
-                        with contextlib.suppress(Exception):
-                            await websocket.close(
-                                code=1009,
-                                reason=(
-                                    "headroom: compression "
-                                    f"{_ws_action.reason} — please "
-                                    "compact context and retry"
-                                ),
-                            )
-                        return
             else:
                 _log_ws_passthrough(
-                    "bypass_header" if _ws_bypass else "optimize_disabled",
+                    "disabled",
                     frame_index=1,
                     raw_bytes=len(first_msg_raw.encode("utf-8", errors="replace")),
                     frame_type="response.create" if body else "unknown",
@@ -7311,7 +7342,7 @@ class OpenAIHandlerMixin:
                     else "unknown",
                 )
 
-            if not _ws_bypass:
+            if not _ws_bypass and not first_frame_error_rollback:
                 (
                     first_msg_raw,
                     _shape_modified,
@@ -7376,17 +7407,15 @@ class OpenAIHandlerMixin:
                     upstream_relay_error: BaseException | None = None
                     client_relay_error: BaseException | None = None
 
-                    async def _maybe_compress_response_create_frame(
+                    async def _maybe_compress_responses_request_frame(
                         raw_msg: str,
                         *,
                         frame_index: int,
                     ) -> tuple[str, bool, str | None]:
-                        """Compress a single client→upstream frame
-                        when its `type` is `response.create`. Other
-                        event types (response.cancel, session.update,
-                        etc.) pass through unchanged. Errors are
-                        warned and the safest frame available is returned —
-                        fail loud in logs, fail safe on the wire.
+                        """Compress one client request frame with a Responses input.
+
+                        Other event types pass through unchanged. Errors return
+                        the original frame and use the error_rollback reason.
                         Updates outer-scope ``tokens_saved``,
                         ``transforms_applied``, and
                         ``ws_frames_compressed`` so the session-end
@@ -7405,12 +7434,10 @@ class OpenAIHandlerMixin:
                                 raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
                             )
                             return raw_msg, False, "non_json"
-                        if (
-                            not isinstance(parsed_frame, dict)
-                            or parsed_frame.get("type") != "response.create"
-                        ):
+                        selected_payload = _openai_responses_ws_frame_payload(parsed_frame)
+                        if selected_payload is None or not isinstance(parsed_frame, dict):
                             _log_ws_passthrough(
-                                "not_response_create",
+                                "nothing_eligible",
                                 frame_index=frame_index,
                                 raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
                                 frame_type=(
@@ -7419,17 +7446,8 @@ class OpenAIHandlerMixin:
                                     else type(parsed_frame).__name__
                                 ),
                             )
-                            return raw_msg, False, "not_response_create"
-                        wrapped_frame = isinstance(parsed_frame.get("response"), dict)
-                        inner_payload = parsed_frame["response"] if wrapped_frame else parsed_frame
-                        if not isinstance(inner_payload, dict):
-                            _log_ws_passthrough(
-                                "invalid_inner_payload",
-                                frame_index=frame_index,
-                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
-                                frame_type="response.create",
-                            )
-                            return raw_msg, False, "invalid_inner_payload"
+                            return raw_msg, False, "nothing_eligible"
+                        inner_payload, wrapped_frame = selected_payload
                         store_forced = _ensure_chatgpt_responses_store_false(
                             inner_payload,
                             is_chatgpt_auth=is_chatgpt_auth,
@@ -7442,31 +7460,44 @@ class OpenAIHandlerMixin:
                                 request_id,
                                 frame_index,
                             )
+                        (
+                            frame_compress_messages,
+                            frame_protect_recent,
+                        ) = _openai_responses_ws_frame_compression_options(
+                            parsed_frame,
+                            inner_payload,
+                            ws_headers,
+                            configured_protect_recent=getattr(
+                                getattr(self, "config", None),
+                                "protect_recent",
+                                _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
+                            ),
+                        )
                         if _ws_bypass:
                             _log_ws_passthrough(
-                                "bypass_header",
+                                "disabled",
                                 frame_index=frame_index,
                                 raw_bytes=len(raw_after_store.encode("utf-8", errors="replace")),
-                                frame_type="response.create",
+                                frame_type=str(parsed_frame.get("type") or "unknown"),
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return (
                                 raw_after_store,
                                 store_forced,
-                                "chatgpt_store_false" if store_forced else "bypass_header",
+                                "chatgpt_store_false" if store_forced else "disabled",
                             )
                         if not self.config.optimize:
                             _log_ws_passthrough(
-                                "optimize_disabled",
+                                "disabled",
                                 frame_index=frame_index,
                                 raw_bytes=len(raw_after_store.encode("utf-8", errors="replace")),
-                                frame_type="response.create",
+                                frame_type=str(parsed_frame.get("type") or "unknown"),
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return (
                                 raw_after_store,
                                 store_forced,
-                                "chatgpt_store_false" if store_forced else "optimize_disabled",
+                                "chatgpt_store_false" if store_forced else "disabled",
                             )
                         frame_compression_elapsed_ms = 0.0
                         try:
@@ -7491,11 +7522,11 @@ class OpenAIHandlerMixin:
                                     frame_attempted_tokens,
                                     frame_compression_timing,
                                 ) = await self._compress_openai_responses_payload_in_executor(
-                                    inner_payload,
+                                    copy.deepcopy(inner_payload),
                                     model=model_for_frame,
                                     request_id=request_id,
-                                    compress_responses_messages=_ws_compress_responses_messages,
-                                    protect_recent=_ws_protect_recent,
+                                    compress_responses_messages=frame_compress_messages,
+                                    protect_recent=frame_protect_recent,
                                     timeout=_codex_ws_compression_timeout_seconds()
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
@@ -7508,19 +7539,11 @@ class OpenAIHandlerMixin:
                                     time.perf_counter() - _compression_started
                                 ) * 1000.0
                                 if frame_compression_elapsed_ms > 0:
-                                    record_frame = getattr(
-                                        getattr(self, "metrics", None),
-                                        "record_codex_ws_frame",
-                                        None,
+                                    _record_ws_frame_diagnostic(
+                                        elapsed_ms=frame_compression_elapsed_ms,
+                                        bytes_before=len(raw_msg.encode("utf-8", errors="replace")),
+                                        failed=True,
                                     )
-                                    if record_frame is not None:
-                                        record_frame(
-                                            elapsed_ms=frame_compression_elapsed_ms,
-                                            bytes_before=len(
-                                                raw_msg.encode("utf-8", errors="replace")
-                                            ),
-                                            failed=True,
-                                        )
                                 logger.warning(
                                     "[%s] WS /v1/responses frame compression "
                                     "timed out; forwarding original: %s: %s",
@@ -7529,13 +7552,13 @@ class OpenAIHandlerMixin:
                                     _frame_err,
                                 )
                                 _log_ws_passthrough(
-                                    "compression_timeout",
+                                    "error_rollback",
                                     frame_index=frame_index,
                                     raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
-                                    frame_type="response.create",
+                                    frame_type=str(parsed_frame.get("type") or "unknown"),
                                     model=str(inner_payload.get("model") or "unknown"),
                                 )
-                                return raw_msg, False, "compression_timeout"
+                                return raw_msg, False, "error_rollback"
                             finally:
                                 frame_compression_elapsed_ms = (
                                     time.perf_counter() - _compression_started
@@ -7545,37 +7568,15 @@ class OpenAIHandlerMixin:
                                     frame_compression_elapsed_ms,
                                 )
                                 _record_ws_compression_overhead(frame_compression_elapsed_ms)
-                            record_frame = getattr(
-                                getattr(self, "metrics", None),
-                                "record_codex_ws_frame",
-                                None,
-                            )
-                            if record_frame is not None:
-                                record_frame(
-                                    elapsed_ms=frame_compression_elapsed_ms,
-                                    bytes_before=bytes_before,
-                                    bytes_after=bytes_after,
-                                    attempted_tokens=frame_attempted_tokens,
-                                    tokens_saved=frame_saved,
-                                    modified=modified,
-                                    strategy_chain=_codex_ws_strategy_chain(frame_transforms),
-                                    final_strategies=_codex_ws_final_strategies(
-                                        frame_compression_timing
-                                    ),
-                                )
+                            if modified and not isinstance(new_inner, dict):
+                                raise TypeError("WS compression returned a non-object payload")
                         except Exception as _frame_err:
                             if frame_compression_elapsed_ms > 0:
-                                record_frame = getattr(
-                                    getattr(self, "metrics", None),
-                                    "record_codex_ws_frame",
-                                    None,
+                                _record_ws_frame_diagnostic(
+                                    elapsed_ms=frame_compression_elapsed_ms,
+                                    bytes_before=len(raw_msg.encode("utf-8", errors="replace")),
+                                    failed=True,
                                 )
-                                if record_frame is not None:
-                                    record_frame(
-                                        elapsed_ms=frame_compression_elapsed_ms,
-                                        bytes_before=len(raw_msg.encode("utf-8", errors="replace")),
-                                        failed=True,
-                                    )
                             logger.warning(
                                 "[%s] WS /v1/responses frame compression "
                                 "failed; forwarding original: %s: %s",
@@ -7584,70 +7585,94 @@ class OpenAIHandlerMixin:
                                 _frame_err,
                             )
                             _log_ws_passthrough(
-                                "compression_exception",
+                                "error_rollback",
                                 frame_index=frame_index,
-                                raw_bytes=len(raw_after_store.encode("utf-8", errors="replace")),
-                                frame_type="response.create",
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                frame_type=str(parsed_frame.get("type") or "unknown"),
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
-                        # Record transform labels even when the frame bytes are
-                        # unchanged: control-arm output-shaper labels
-                        # (output_shaper:control:*) must reach the outcome
-                        # ledger for A/B baseline accounting.
-                        for t in frame_transforms:
-                            if t not in transforms_applied:
-                                transforms_applied.append(t)
-                        return (
-                            raw_after_store,
-                            store_forced,
-                            "chatgpt_store_false" if store_forced else "compression_exception",
-                        )
+                            return raw_msg, False, "error_rollback"
                         if not modified:
-                            reason = frame_reason or "no_compression"
+                            _record_ws_frame_diagnostic(
+                                elapsed_ms=frame_compression_elapsed_ms,
+                                bytes_before=bytes_before,
+                                bytes_after=bytes_after,
+                                attempted_tokens=frame_attempted_tokens,
+                                tokens_saved=frame_saved,
+                                modified=False,
+                                strategy_chain=_codex_ws_strategy_chain(frame_transforms),
+                                final_strategies=_codex_ws_final_strategies(
+                                    frame_compression_timing
+                                ),
+                            )
+                            # Control-arm labels must reach the outcome ledger,
+                            # even when the frame bytes stay unchanged.
+                            for t in frame_transforms:
+                                if t not in transforms_applied:
+                                    transforms_applied.append(t)
                             _log_ws_passthrough(
-                                reason,
+                                "nothing_eligible",
                                 frame_index=frame_index,
                                 raw_bytes=len(raw_after_store.encode("utf-8", errors="replace")),
-                                frame_type="response.create",
+                                frame_type=str(parsed_frame.get("type") or "unknown"),
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return (
                                 raw_after_store,
                                 store_forced,
-                                "chatgpt_store_false" if store_forced else reason,
-                            )
-                        if not isinstance(new_inner, dict):
-                            _log_ws_passthrough(
-                                "compressed_payload_not_dict",
-                                frame_index=frame_index,
-                                raw_bytes=len(raw_after_store.encode("utf-8", errors="replace")),
-                                frame_type="response.create",
-                                model=str(inner_payload.get("model") or "unknown"),
-                            )
-                            return (
-                                raw_after_store,
-                                store_forced,
-                                "chatgpt_store_false"
-                                if store_forced
-                                else "compressed_payload_not_dict",
+                                "chatgpt_store_false" if store_forced else "nothing_eligible",
                             )
                         _ensure_chatgpt_responses_store_false(
                             new_inner,
                             is_chatgpt_auth=is_chatgpt_auth,
                         )
-                        if wrapped_frame:
-                            _rewrite_started = time.perf_counter()
-                            parsed_frame["response"] = new_inner
-                            rewritten = json.dumps(parsed_frame)
-                        else:
-                            _rewrite_started = time.perf_counter()
-                            rewritten = json.dumps(new_inner)
+                        _rewrite_started = time.perf_counter()
+                        try:
+                            if wrapped_frame:
+                                parsed_frame["response"] = new_inner
+                                rewritten = json.dumps(parsed_frame)
+                            else:
+                                rewritten = json.dumps(new_inner)
+                        except Exception as _rewrite_err:
+                            _record_ws_frame_diagnostic(
+                                elapsed_ms=frame_compression_elapsed_ms,
+                                bytes_before=len(raw_msg.encode("utf-8", errors="replace")),
+                                failed=True,
+                            )
+                            logger.warning(
+                                "[%s] WS /v1/responses frame rewrite failed; "
+                                "forwarding original: %s: %s",
+                                request_id,
+                                type(_rewrite_err).__name__,
+                                _rewrite_err,
+                            )
+                            _log_ws_passthrough(
+                                "error_rollback",
+                                frame_index=frame_index,
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                frame_type=str(parsed_frame.get("type") or "unknown"),
+                                model=str(inner_payload.get("model") or "unknown"),
+                            )
+                            return raw_msg, False, "error_rollback"
                         _rewrite_ms = (time.perf_counter() - _rewrite_started) * 1000.0
                         _record_ws_compression_timing(
                             "compression_payload_rewrite_json_dump",
                             _rewrite_ms,
                         )
                         _record_ws_compression_overhead(_rewrite_ms)
+                        _record_ws_frame_diagnostic(
+                            elapsed_ms=frame_compression_elapsed_ms,
+                            bytes_before=bytes_before,
+                            bytes_after=bytes_after,
+                            attempted_tokens=frame_attempted_tokens,
+                            tokens_saved=frame_saved,
+                            modified=True,
+                            strategy_chain=_codex_ws_strategy_chain(frame_transforms),
+                            final_strategies=_codex_ws_final_strategies(frame_compression_timing),
+                        )
+                        for t in frame_transforms:
+                            if t not in transforms_applied:
+                                transforms_applied.append(t)
                         tokens_saved += int(frame_saved)
                         attempted_input_tokens_total += int(frame_attempted_tokens)
                         ws_frames_compressed += 1
@@ -7726,11 +7751,11 @@ class OpenAIHandlerMixin:
                                     msg,
                                     _frame_modified,
                                     _frame_reason,
-                                ) = await _maybe_compress_response_create_frame(
+                                ) = await _maybe_compress_responses_request_frame(
                                     msg,
                                     frame_index=client_frame_index,
                                 )
-                                if not _ws_bypass:
+                                if not _ws_bypass and _frame_reason != "error_rollback":
                                     (
                                         msg,
                                         _shape_modified,
@@ -8417,7 +8442,7 @@ class OpenAIHandlerMixin:
             # which made first-frame no-changes invisible). We record
             # one entry per WS session that aggregates `tokens_saved`
             # across every `response.create` frame compressed by the
-            # first-frame block + `_maybe_compress_response_create_frame`.
+            # first-frame block + `_maybe_compress_responses_request_frame`.
             # The RequestLog entry mirrors the streaming.py /
             # anthropic.py shape so /transformations/feed surfaces
             # Codex WS turns.
