@@ -95,6 +95,9 @@ _OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_DEFAULT = r"^(scip_|mcp__|.*__scip_)"
 _OPENAI_RESPONSES_TOOL_OUTPUT_EXEMPT_TRANSFORM = (
     "router:openai:responses:function_call_output:exempt"
 )
+_OPENAI_RESPONSES_CODEX_WS_TOOL_OUTPUT_EXEMPT_TRANSFORM = (
+    "router:openai:responses:function_call_output:codex_ws_exempt"
+)
 _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
@@ -118,6 +121,28 @@ def _openai_responses_tool_output_exclude_pattern() -> re.Pattern[str] | None:
             exc,
         )
         return re.compile(_OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_DEFAULT)
+
+
+def _update_openai_responses_function_name_map(
+    value: Any,
+    function_name_by_call_id: dict[str, str],
+) -> None:
+    """Record Responses function names from one decoded WebSocket frame."""
+
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, list):
+            pending.extend(current)
+            continue
+        if not isinstance(current, dict):
+            continue
+        if current.get("type") == "function_call":
+            call_id = current.get("call_id")
+            name = current.get("name")
+            if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+                function_name_by_call_id[call_id] = name
+        pending.extend(nested for nested in current.values() if isinstance(nested, (dict, list)))
 
 
 def _codex_ws_compression_timeout_seconds() -> float:
@@ -1870,6 +1895,7 @@ class OpenAIHandlerMixin:
         timing: dict[str, float] | None = None,
         compress_responses_messages: bool = False,
         protect_recent: int | None = None,
+        codex_ws_function_name_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -2084,6 +2110,13 @@ class OpenAIHandlerMixin:
             if tool_output_exclude_pattern is not None
             and tool_output_exclude_pattern.search(fn_name) is not None
         }
+        codex_ws_compression_exempt_call_ids: set[str] = {
+            call_id
+            for call_id, fn_name in (codex_ws_function_name_by_call_id or {}).items()
+            if tool_output_exclude_pattern is not None
+            and tool_output_exclude_pattern.search(fn_name) is not None
+        }
+        compression_exempt_call_ids.update(codex_ws_compression_exempt_call_ids)
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
 
@@ -2123,8 +2156,13 @@ class OpenAIHandlerMixin:
                     and call_id in compression_exempt_call_ids
                 ):
                     exempt_output_call_ids.add(call_id)
-                    if _OPENAI_RESPONSES_TOOL_OUTPUT_EXEMPT_TRANSFORM not in exemption_transforms:
-                        exemption_transforms.append(_OPENAI_RESPONSES_TOOL_OUTPUT_EXEMPT_TRANSFORM)
+                    exemption_transform = (
+                        _OPENAI_RESPONSES_CODEX_WS_TOOL_OUTPUT_EXEMPT_TRANSFORM
+                        if call_id in codex_ws_compression_exempt_call_ids
+                        else _OPENAI_RESPONSES_TOOL_OUTPUT_EXEMPT_TRANSFORM
+                    )
+                    if exemption_transform not in exemption_transforms:
+                        exemption_transforms.append(exemption_transform)
                     if debug_enabled:
                         extraction_debug.append(
                             {
@@ -2133,7 +2171,8 @@ class OpenAIHandlerMixin:
                                 "reason": "tool_output_compression_exempt",
                                 "item_type": item_type,
                                 "call_id": call_id,
-                                "tool_name": function_name_by_call_id.get(call_id),
+                                "tool_name": function_name_by_call_id.get(call_id)
+                                or (codex_ws_function_name_by_call_id or {}).get(call_id),
                                 "item": item,
                             }
                         )
@@ -2759,6 +2798,7 @@ class OpenAIHandlerMixin:
         protect_recent: int | None = None,
         client: str | None = None,
         preserve_tools: bool = False,
+        codex_ws_function_name_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2986,6 +3026,7 @@ class OpenAIHandlerMixin:
             timing=timing_sink,
             compress_responses_messages=compress_responses_messages,
             protect_recent=protect_recent,
+            codex_ws_function_name_by_call_id=codex_ws_function_name_by_call_id,
         )
         _add_timing("compression_live_units_total", live_units_started)
         transforms.extend(router_transforms)
@@ -3110,6 +3151,7 @@ class OpenAIHandlerMixin:
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
         preserve_tools: bool = False,
+        codex_ws_function_name_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
         compression_kwargs: dict[str, Any] = {
@@ -3123,6 +3165,10 @@ class OpenAIHandlerMixin:
             compression_kwargs["protect_recent"] = protect_recent
         if preserve_tools:
             compression_kwargs["preserve_tools"] = True
+        if codex_ws_function_name_by_call_id is not None:
+            compression_kwargs["codex_ws_function_name_by_call_id"] = (
+                codex_ws_function_name_by_call_id
+            )
 
         def _compress():  # noqa: ANN202
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
@@ -3147,6 +3193,7 @@ class OpenAIHandlerMixin:
                         (
                             name
                             for name in (
+                                "codex_ws_function_name_by_call_id",
                                 "client",
                                 "preserve_tools",
                                 "timing",
@@ -6828,12 +6875,17 @@ class OpenAIHandlerMixin:
             # compression ratio surfaced to the dashboard.
             attempted_input_tokens_total = 0
             transforms_applied: list[str] = []
+            codex_ws_function_name_by_call_id: dict[str, str] = {}
             ws_frames_compressed = 0
             try:
                 body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
                 # Not JSON — pass through as-is
                 pass
+            _update_openai_responses_function_name_map(
+                body,
+                codex_ws_function_name_by_call_id,
+            )
             if isinstance(body, dict) and body:
                 ws_response_body_for_store = (
                     body["response"] if isinstance(body.get("response"), dict) else body
@@ -7281,6 +7333,9 @@ class OpenAIHandlerMixin:
                                 else COMPRESSION_TIMEOUT_SECONDS,
                                 client=client,
                                 preserve_tools=client == "codex",
+                                codex_ws_function_name_by_call_id=dict(
+                                    codex_ws_function_name_by_call_id
+                                ),
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -7514,6 +7569,10 @@ class OpenAIHandlerMixin:
                             )
                             return raw_msg, False, "nothing_eligible"
                         inner_payload, wrapped_frame = selected_payload
+                        _update_openai_responses_function_name_map(
+                            inner_payload,
+                            codex_ws_function_name_by_call_id,
+                        )
                         store_forced = _ensure_chatgpt_responses_store_false(
                             inner_payload,
                             is_chatgpt_auth=is_chatgpt_auth,
@@ -7598,6 +7657,9 @@ class OpenAIHandlerMixin:
                                     else COMPRESSION_TIMEOUT_SECONDS,
                                     client=client,
                                     preserve_tools=client == "codex",
+                                    codex_ws_function_name_by_call_id=dict(
+                                        codex_ws_function_name_by_call_id
+                                    ),
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -8154,6 +8216,10 @@ class OpenAIHandlerMixin:
                                     continue
 
                                 event_type = event.get("type", "")
+                                _update_openai_responses_function_name_map(
+                                    event,
+                                    codex_ws_function_name_by_call_id,
+                                )
                                 ws_last_upstream_frame_type = str(event_type or "unknown")
                                 logger.debug(
                                     "[%s] WS upstream frame session_id=%s frame=%d type=%s",

@@ -12,7 +12,7 @@ import contextlib
 import json
 import logging
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,7 +20,13 @@ import pytest
 import headroom.proxy.handlers.openai as openai_module
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
-from headroom.transforms.content_router import ContentRouter
+from headroom.transforms.content_router import (
+    CompressionStrategy,
+    ContentRouter,
+    RouterCompressionResult,
+)
+
+CODEX_WS_EXEMPT_TRANSFORM = "router:openai:responses:function_call_output:codex_ws_exempt"
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -242,11 +248,13 @@ class _FakeUpstream:
         events: list[str],
         *,
         hold_after_events: bool = False,
+        wait_for_sent_count: int = 0,
         raise_mid_stream: Exception | None = None,
         response_headers=None,
     ) -> None:
         self._events = list(events)
         self._hold_after_events = hold_after_events
+        self._wait_for_sent_count = wait_for_sent_count
         self._raise_mid_stream = raise_mid_stream
         self.sent: list[str] = []
         self.closed = False
@@ -270,6 +278,8 @@ class _FakeUpstream:
         return self._iter()
 
     async def _iter(self):
+        while len(self.sent) < self._wait_for_sent_count:
+            await asyncio.sleep(0)
         for ev in self._events:
             yield ev
         if self._raise_mid_stream is not None:
@@ -314,6 +324,59 @@ def _first_frame() -> str:
         {
             "type": "response.create",
             "response": {"model": "gpt-5.4", "input": "hi"},
+        }
+    )
+
+
+def _tool_call_frame(tool_name: str, call_id: str) -> str:
+    return json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "arguments": "{}",
+                    }
+                ],
+            },
+        }
+    )
+
+
+def _tool_output_frame(output: str, call_id: str) -> str:
+    return json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    }
+                ],
+            },
+        }
+    )
+
+
+def _large_tool_output() -> str:
+    return " ".join(f"tool_output_{index}" for index in range(180))
+
+
+def _completed_response_event() -> str:
+    return json.dumps(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "r_tool_output",
+                "usage": {"input_tokens": 200, "output_tokens": 1},
+            },
         }
     )
 
@@ -695,6 +758,103 @@ async def test_ws_later_response_create_frame_uses_shared_compression(monkeypatc
     forwarded = json.loads(upstream.sent[-1])
     assert forwarded["type"] == "response.create"
     assert handler.metrics.codex_ws_frames[-1]["tokens_saved"] > 0
+
+
+@pytest.mark.asyncio
+async def test_ws_scip_tool_output_skips_cached_shell_variant(monkeypatch):
+    monkeypatch.delenv("HEADROOM_COMPRESS_TOOL_OUTPUT_EXCLUDE", raising=False)
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    large_output = _large_tool_output()
+    shell_call_frame = _tool_call_frame("shell", "call_shell_cache_seed")
+    shell_output_frame = _tool_output_frame(large_output, "call_shell_cache_seed")
+    scip_call_frame = _tool_call_frame("scip_map", "call_scip_map")
+    scip_output_frame = _tool_output_frame(large_output, "call_scip_map")
+    upstream = _FakeUpstream(
+        [_completed_response_event()],
+        wait_for_sent_count=4,
+    )
+    client_ws = _FakeWebSocket(
+        frames=[shell_call_frame, shell_output_frame, scip_call_frame, scip_output_frame],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    router = ContentRouter()
+    router.config.exclude_tools = set()
+    outcomes = []
+    compressed_contents = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+
+    def _compress(self, content: str, **_kwargs):
+        compressed_contents.append(content)
+        return RouterCompressionResult(
+            compressed="compressed shell output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(_compress, router)
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+
+    assert json.loads(upstream.sent[1])["response"]["input"][0]["output"] == (
+        "compressed shell output"
+    )
+    assert upstream.sent[3] == scip_output_frame
+    assert compressed_contents == [large_output]
+    assert outcomes
+    assert CODEX_WS_EXEMPT_TRANSFORM in outcomes[-1].transforms_applied
+
+
+@pytest.mark.asyncio
+async def test_ws_shell_tool_output_still_compresses_across_frames(monkeypatch):
+    monkeypatch.delenv("HEADROOM_COMPRESS_TOOL_OUTPUT_EXCLUDE", raising=False)
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    call_id = "call_shell"
+    call_frame = _tool_call_frame("shell", call_id)
+    output_frame = _tool_output_frame(_large_tool_output(), call_id)
+    upstream = _FakeUpstream(
+        [_completed_response_event()],
+        wait_for_sent_count=2,
+    )
+    client_ws = _FakeWebSocket(
+        frames=[call_frame, output_frame],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    router = ContentRouter()
+    router.config.exclude_tools = set()
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+
+    def _compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed shell output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(_compress, router)
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+
+    forwarded_output = json.loads(upstream.sent[1])["response"]["input"][0]["output"]
+    assert forwarded_output == "compressed shell output"
+    assert outcomes[-1].tokens_saved > 0
+    assert CODEX_WS_EXEMPT_TRANSFORM not in outcomes[-1].transforms_applied
 
 
 @pytest.mark.asyncio
