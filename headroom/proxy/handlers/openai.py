@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -89,10 +90,34 @@ _OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v3"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_ENV = "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
 _OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
+_OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_ENV = "HEADROOM_COMPRESS_TOOL_OUTPUT_EXCLUDE"
+_OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_DEFAULT = r"^(scip_|mcp__|.*__scip_)"
+_OPENAI_RESPONSES_TOOL_OUTPUT_EXEMPT_TRANSFORM = (
+    "router:openai:responses:function_call_output:exempt"
+)
 _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
+
+
+def _openai_responses_tool_output_exclude_pattern() -> re.Pattern[str] | None:
+    pattern = os.environ.get(
+        _OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_ENV,
+        _OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_DEFAULT,
+    )
+    if pattern == "":
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        logger.warning(
+            "Invalid %s regex %r; using the default: %s",
+            _OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_ENV,
+            pattern,
+            exc,
+        )
+        return re.compile(_OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_DEFAULT)
 
 
 def _codex_ws_compression_timeout_seconds() -> float:
@@ -2052,6 +2077,13 @@ class OpenAIHandlerMixin:
             for call_id, fn_name in function_name_by_call_id.items()
             if is_tool_excluded(fn_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
         }
+        tool_output_exclude_pattern = _openai_responses_tool_output_exclude_pattern()
+        compression_exempt_call_ids: set[str] = {
+            call_id
+            for call_id, fn_name in function_name_by_call_id.items()
+            if tool_output_exclude_pattern is not None
+            and tool_output_exclude_pattern.search(fn_name) is not None
+        }
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
 
@@ -2066,6 +2098,8 @@ class OpenAIHandlerMixin:
         # (item_index, slot_ref, folded_text, original_text). Spliced after the
         # normal candidate compression — no ML, byte/data-lossless only.
         lossless_excluded: list[tuple[int, tuple[str, int | None], str, str]] = []
+        exempt_output_call_ids: set[str] = set()
+        exemption_transforms: list[str] = []
         extraction_debug: list[dict[str, Any]] = []
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
@@ -2083,6 +2117,27 @@ class OpenAIHandlerMixin:
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 call_id = item.get("call_id")
+                if (
+                    item_type == "function_call_output"
+                    and isinstance(call_id, str)
+                    and call_id in compression_exempt_call_ids
+                ):
+                    exempt_output_call_ids.add(call_id)
+                    if _OPENAI_RESPONSES_TOOL_OUTPUT_EXEMPT_TRANSFORM not in exemption_transforms:
+                        exemption_transforms.append(_OPENAI_RESPONSES_TOOL_OUTPUT_EXEMPT_TRANSFORM)
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "tool_output_compression_exempt",
+                                "item_type": item_type,
+                                "call_id": call_id,
+                                "tool_name": function_name_by_call_id.get(call_id),
+                                "item": item,
+                            }
+                        )
+                    continue
                 if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
                     if debug_enabled:
                         extraction_debug.append(
@@ -2303,11 +2358,11 @@ class OpenAIHandlerMixin:
                 modified=False,
                 reason="no_candidates",
                 tokens_saved_total=0,
-                transforms=[],
+                transforms=exemption_transforms,
                 input_payload=payload,
                 output_payload=payload,
             )
-            return payload, False, 0, [], {}, [], 0
+            return payload, False, 0, exemption_transforms, {}, [], 0
 
         deepcopy_started = time.perf_counter()
         updated = copy.deepcopy(payload)
@@ -2331,7 +2386,7 @@ class OpenAIHandlerMixin:
         # comparing tokens_saved against tokens we ATTEMPTED to compress, not
         # against everything in the request.
         attempted_input_tokens = 0
-        transforms: list[str] = []
+        transforms = list(exemption_transforms)
         routed_units: list[RoutedCompressionUnit] = []
 
         unit_build_started = time.perf_counter()
@@ -2664,7 +2719,7 @@ class OpenAIHandlerMixin:
                 updated_items,
                 self.OPENAI_RESPONSES_OUTPUT_TYPES,
                 tokenizer.count_text,
-                protected_call_ids=verbatim_excluded_call_ids,
+                protected_call_ids=(verbatim_excluded_call_ids | exempt_output_call_ids),
             )
             if dd_folded:
                 modified = True
@@ -2933,12 +2988,12 @@ class OpenAIHandlerMixin:
             protect_recent=protect_recent,
         )
         _add_timing("compression_live_units_total", live_units_started)
+        transforms.extend(router_transforms)
         if router_modified:
             working = router_payload
             modified = True
             reason = None
             tokens_saved += int(router_saved)
-            transforms.extend(router_transforms)
         elif not modified:
             reason = "router_no_compression"
 

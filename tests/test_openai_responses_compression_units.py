@@ -902,7 +902,7 @@ def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
 
     assert modified is False
     assert saved == 0
-    assert transforms == []
+    assert transforms == ["router:openai:responses:function_call_output:exempt"]
     assert new_payload == payload
     assert units_by_category == {}
     assert strategy_chain == []
