@@ -92,6 +92,9 @@ _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
 _OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
 _OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_ENV = "HEADROOM_COMPRESS_TOOL_OUTPUT_EXCLUDE"
 _OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_DEFAULT = r"^(scip_|mcp__|.*__scip_)"
+_OPENAI_RESPONSES_CONTENT_EXCLUDE_ENV = "HEADROOM_COMPRESS_CONTENT_EXCLUDE"
+_OPENAI_RESPONSES_CONTENT_EXCLUDE_DEFAULT = r"(?m)^resolved \S+ → |^definition: |^## `"
+_OPENAI_RESPONSES_CONTENT_EXEMPT_TRANSFORM = "router:openai:responses:content_exempt"
 _OPENAI_RESPONSES_TOOL_OUTPUT_EXEMPT_TRANSFORM = (
     "router:openai:responses:function_call_output:exempt"
 )
@@ -121,6 +124,28 @@ def _openai_responses_tool_output_exclude_pattern() -> re.Pattern[str] | None:
             exc,
         )
         return re.compile(_OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_DEFAULT)
+
+
+def _openai_responses_content_exclude_pattern() -> re.Pattern[str] | None:
+    pattern = os.environ.get(
+        _OPENAI_RESPONSES_CONTENT_EXCLUDE_ENV,
+        _OPENAI_RESPONSES_CONTENT_EXCLUDE_DEFAULT,
+    )
+    if pattern == "":
+        return None
+    try:
+        return re.compile(pattern, flags=re.MULTILINE)
+    except re.error as exc:
+        logger.warning(
+            "Invalid %s regex %r; using the default: %s",
+            _OPENAI_RESPONSES_CONTENT_EXCLUDE_ENV,
+            pattern,
+            exc,
+        )
+        return re.compile(
+            _OPENAI_RESPONSES_CONTENT_EXCLUDE_DEFAULT,
+            flags=re.MULTILINE,
+        )
 
 
 def _update_openai_responses_function_name_map(
@@ -1065,6 +1090,7 @@ def _dedup_responses_output_items(
     output_types: frozenset[str],
     count_tokens: Any = None,
     protected_call_ids: set[str] | None = None,
+    protected_item_indexes: set[int] | None = None,
 ) -> tuple[int, int]:
     """Cross-turn verbatim de-dup over Responses tool-output items (mutates in place).
 
@@ -1086,6 +1112,7 @@ def _dedup_responses_output_items(
     except Exception:
         return 0, 0
 
+    protected_item_indexes = protected_item_indexes or set()
     locs: list[int] = []
     blocks: list[DedupBlock] = []
     for i, item in enumerate(items):
@@ -1099,9 +1126,12 @@ def _dedup_responses_output_items(
                     text=out,
                     turn=i,
                     protected=bool(
-                        isinstance(item.get("call_id"), str)
-                        and protected_call_ids
-                        and item.get("call_id") in protected_call_ids
+                        i in protected_item_indexes
+                        or (
+                            isinstance(item.get("call_id"), str)
+                            and protected_call_ids
+                            and item.get("call_id") in protected_call_ids
+                        )
                     ),
                 )
             )
@@ -1933,6 +1963,7 @@ class OpenAIHandlerMixin:
             from headroom.transforms.compression_units import (
                 CompressionUnit,
                 RoutedCompressionUnit,
+                UnitCompressionResult,
                 compress_unit_with_router,
                 find_content_router,
             )
@@ -2104,6 +2135,7 @@ class OpenAIHandlerMixin:
             if is_tool_excluded(fn_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
         }
         tool_output_exclude_pattern = _openai_responses_tool_output_exclude_pattern()
+        content_exclude_pattern = _openai_responses_content_exclude_pattern()
         compression_exempt_call_ids: set[str] = {
             call_id
             for call_id, fn_name in function_name_by_call_id.items()
@@ -2427,6 +2459,8 @@ class OpenAIHandlerMixin:
         attempted_input_tokens = 0
         transforms = list(exemption_transforms)
         routed_units: list[RoutedCompressionUnit] = []
+        content_exempt_unit_indexes: set[int] = set()
+        content_exempt_item_indexes: set[int] = set()
 
         unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
@@ -2450,6 +2484,13 @@ class OpenAIHandlerMixin:
                 metadata=metadata,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
+            if (
+                item_type != "message"
+                and content_exclude_pattern is not None
+                and content_exclude_pattern.search(original_text) is not None
+            ):
+                content_exempt_unit_indexes.add(len(routed_units) - 1)
+                content_exempt_item_indexes.add(item_idx)
             if debug_enabled:
                 unit_debug.append(
                     {
@@ -2512,6 +2553,30 @@ class OpenAIHandlerMixin:
         small_batch_entries: list[CompressionBatchEntry] = []
         large_unit_indexes: list[int] = []
         for unit_idx, routed in enumerate(routed_units):
+            if unit_idx in content_exempt_unit_indexes:
+                tokens_before = tokenizer.count_text(routed.unit.text)
+                routed_results[unit_idx] = (
+                    routed.slot,
+                    UnitCompressionResult(
+                        original=routed.unit.text,
+                        compressed=routed.unit.text,
+                        modified=False,
+                        tokens_before=tokens_before,
+                        tokens_after=tokens_before,
+                        tokens_saved=0,
+                        transforms_applied=[_OPENAI_RESPONSES_CONTENT_EXEMPT_TRANSFORM],
+                        strategy="passthrough",
+                        reason="content_exempt",
+                        router_result=None,
+                        text_bytes=len(
+                            routed.unit.text.encode("utf-8", errors="replace")
+                        ),
+                        min_bytes=routed.unit.min_bytes,
+                        reason_category="content_exempt",
+                    ),
+                    0.0,
+                )
+                continue
             text_bytes = len(routed.unit.text.encode("utf-8", errors="replace"))
             if text_bytes < routed.unit.min_bytes:
                 small_batch_entries.append(
@@ -2682,6 +2747,9 @@ class OpenAIHandlerMixin:
                     strategy_chain_union.append(s)
             cat = result.reason_category or "applied"
             units_by_category[cat] = units_by_category.get(cat, 0) + 1
+            for transform in result.transforms_applied:
+                if transform not in transforms:
+                    transforms.append(transform)
             # A unit "reached the router" iff the result carries a
             # router_result OR was modified — both indicate we got
             # past the early gates. Units that were size-floored,
@@ -2724,9 +2792,6 @@ class OpenAIHandlerMixin:
             if _set_slot_text(target_item, slot_ref, result.compressed):
                 modified = True
                 tokens_saved_total += result.tokens_saved
-                for transform in result.transforms_applied:
-                    if transform not in transforms:
-                        transforms.append(transform)
         _add_timing("compression_unit_apply_results", apply_started)
 
         # Splice byte/data-lossless folds of excluded tool outputs (grep/log/
@@ -2759,6 +2824,7 @@ class OpenAIHandlerMixin:
                 self.OPENAI_RESPONSES_OUTPUT_TYPES,
                 tokenizer.count_text,
                 protected_call_ids=(verbatim_excluded_call_ids | exempt_output_call_ids),
+                protected_item_indexes=content_exempt_item_indexes,
             )
             if dd_folded:
                 modified = True

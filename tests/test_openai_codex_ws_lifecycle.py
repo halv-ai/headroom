@@ -27,6 +27,7 @@ from headroom.transforms.content_router import (
 )
 
 CODEX_WS_EXEMPT_TRANSFORM = "router:openai:responses:function_call_output:codex_ws_exempt"
+CONTENT_EXEMPT_TRANSFORM = "router:openai:responses:content_exempt"
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -359,6 +360,25 @@ def _tool_output_frame(output: str, call_id: str) -> str:
                         "call_id": call_id,
                         "output": output,
                     }
+                ],
+            },
+        }
+    )
+
+
+def _custom_tool_output_frame(outputs: list[tuple[str, str]]) -> str:
+    return json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": [
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    }
+                    for call_id, output in outputs
                 ],
             },
         }
@@ -855,6 +875,225 @@ async def test_ws_shell_tool_output_still_compresses_across_frames(monkeypatch):
     assert forwarded_output == "compressed shell output"
     assert outcomes[-1].tokens_saved > 0
     assert CODEX_WS_EXEMPT_TRANSFORM not in outcomes[-1].transforms_applied
+
+
+@pytest.mark.asyncio
+async def test_ws_custom_tool_output_content_signature_is_byte_identical(monkeypatch):
+    monkeypatch.delenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", raising=False)
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    crux_output = "\n".join(
+        [
+            "resolved make_model_tuple → `x`/make_model_tuple().",
+            "## `x`",
+            "definition: path.py:12",
+            *(f"symbol detail {index}: preserve exact navigation data" for index in range(80)),
+        ]
+    )
+    original_frame = _custom_tool_output_frame([("call_exec", crux_output)])
+    upstream = _FakeUpstream([_completed_response_event()])
+    client_ws = _FakeWebSocket(frames=[original_frame])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    router = ContentRouter()
+    router.config.exclude_tools = set()
+    outcomes = []
+    debug_events = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    def _unexpected_compression(self, content: str, **_kwargs):
+        raise AssertionError(f"content-exempt output reached the router: {content[:40]}")
+
+    def _capture_debug(event: str, **payload):
+        debug_events.append((event, payload))
+
+    handler._record_request_outcome = _record_request_outcome
+    router.compress = MethodType(_unexpected_compression, router)
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+    monkeypatch.setattr(openai_module, "_log_codex_compression_debug", _capture_debug)
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert upstream.sent[0] == original_frame
+    assert outcomes
+    assert CONTENT_EXEMPT_TRANSFORM in outcomes[-1].transforms_applied
+    assert not hasattr(handler, "_openai_responses_unit_result_cache")
+    unit_events = [payload for event, payload in debug_events if event == "codex_compression_unit_result"]
+    assert len(unit_events) == 1
+    assert unit_events[0]["original"] == crux_output
+    assert unit_events[0]["compressed"] == crux_output
+    assert unit_events[0]["transforms_applied"] == [CONTENT_EXEMPT_TRANSFORM]
+
+
+@pytest.mark.asyncio
+async def test_ws_shell_looking_custom_tool_output_still_compresses(monkeypatch):
+    monkeypatch.delenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", raising=False)
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    build_output = "\n".join(
+        [
+            "Script completed successfully.",
+            *(f"build log line {index}: compiled target module_{index}" for index in range(400)),
+        ]
+    )
+    original_frame = _custom_tool_output_frame([("call_exec", build_output)])
+    upstream = _FakeUpstream([_completed_response_event()])
+    client_ws = _FakeWebSocket(frames=[original_frame])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    router = ContentRouter()
+    router.config.exclude_tools = set()
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    def _compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed build log",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    handler._record_request_outcome = _record_request_outcome
+    router.compress = MethodType(_compress, router)
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    forwarded = json.loads(upstream.sent[0])
+    assert forwarded["response"]["input"][0]["output"] == "compressed build log"
+    assert outcomes[-1].tokens_saved > 0
+    assert CONTENT_EXEMPT_TRANSFORM not in outcomes[-1].transforms_applied
+
+
+@pytest.mark.asyncio
+async def test_ws_content_signature_env_override_changes_exempt_output(monkeypatch):
+    monkeypatch.setenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", r"^KEEP EXACT:")
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    override_output = "KEEP EXACT:\n" + "\n".join(
+        f"override detail {index}: preserve this line" for index in range(80)
+    )
+    default_signature_output = "resolved make_model_tuple → `x`/make_model_tuple().\n" + "\n".join(
+        f"default detail {index}: this unit can compress" for index in range(80)
+    )
+    original_frame = _custom_tool_output_frame(
+        [
+            ("call_override", override_output),
+            ("call_default", default_signature_output),
+        ]
+    )
+    upstream = _FakeUpstream([_completed_response_event()])
+    client_ws = _FakeWebSocket(frames=[original_frame])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    router = ContentRouter()
+    router.config.exclude_tools = set()
+    compressed_contents = []
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    def _compress(self, content: str, **_kwargs):
+        compressed_contents.append(content)
+        return RouterCompressionResult(
+            compressed="compressed default-signature output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    handler._record_request_outcome = _record_request_outcome
+    router.compress = MethodType(_compress, router)
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    forwarded_items = json.loads(upstream.sent[0])["response"]["input"]
+    assert forwarded_items[0]["output"] == override_output
+    assert forwarded_items[1]["output"] == "compressed default-signature output"
+    assert compressed_contents == [default_signature_output]
+    assert CONTENT_EXEMPT_TRANSFORM in outcomes[-1].transforms_applied
+
+
+@pytest.mark.asyncio
+async def test_ws_empty_content_signature_disables_guard(monkeypatch):
+    monkeypatch.setenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", "")
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    output = "resolved make_model_tuple → `x`/make_model_tuple().\n" + "\n".join(
+        f"symbol detail {index}: compress after guard disable" for index in range(80)
+    )
+    original_frame = _custom_tool_output_frame([("call_exec", output)])
+    upstream = _FakeUpstream([_completed_response_event()])
+    client_ws = _FakeWebSocket(frames=[original_frame])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    router = ContentRouter()
+    router.config.exclude_tools = set()
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    def _compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed disabled-guard output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    handler._record_request_outcome = _record_request_outcome
+    router.compress = MethodType(_compress, router)
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    forwarded = json.loads(upstream.sent[0])
+    assert forwarded["response"]["input"][0]["output"] == "compressed disabled-guard output"
+    assert CONTENT_EXEMPT_TRANSFORM not in outcomes[-1].transforms_applied
+
+
+@pytest.mark.asyncio
+async def test_ws_invalid_content_signature_warns_and_uses_default(
+    caplog,
+    monkeypatch,
+):
+    monkeypatch.setenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", "[")
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    output = "definition: path.py:12\n" + "\n".join(
+        f"definition detail {index}: preserve fallback output" for index in range(80)
+    )
+    original_frame = _custom_tool_output_frame([("call_exec", output)])
+    upstream = _FakeUpstream([_completed_response_event()])
+    client_ws = _FakeWebSocket(frames=[original_frame])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    router = ContentRouter()
+    router.config.exclude_tools = set()
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    def _unexpected_compression(self, content: str, **_kwargs):
+        raise AssertionError(f"fallback-exempt output reached the router: {content[:40]}")
+
+    handler._record_request_outcome = _record_request_outcome
+    router.compress = MethodType(_unexpected_compression, router)
+    handler.openai_pipeline = SimpleNamespace(transforms=[router])
+    caplog.set_level(logging.WARNING, logger="headroom.proxy")
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert upstream.sent[0] == original_frame
+    assert CONTENT_EXEMPT_TRANSFORM in outcomes[-1].transforms_applied
+    assert "Invalid HEADROOM_COMPRESS_CONTENT_EXCLUDE regex" in caplog.text
+    assert "using the default" in caplog.text
 
 
 @pytest.mark.asyncio
