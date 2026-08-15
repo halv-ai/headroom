@@ -32,7 +32,7 @@ def _handler_with_router(router: ContentRouter) -> OpenAIHandlerMixin:
     handler.config = SimpleNamespace(
         compress_responses_messages=False,
         compress_user_messages=False,
-        protect_recent=None,
+        protect_recent=0,
     )
     return handler
 
@@ -143,7 +143,7 @@ def test_openai_responses_adapter_compresses_only_live_text_slots():
 
     def compress(self, content: str, **_kwargs):
         return RouterCompressionResult(
-            compressed="kept words",
+            compressed="kept words <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -177,7 +177,7 @@ def test_openai_responses_adapter_compresses_only_live_text_slots():
     assert saved > 0
     assert new_payload["input"][0]["encrypted_content"] == long_text
     assert new_payload["input"][1]["arguments"] == long_text
-    assert new_payload["input"][2]["output"] == "kept words"
+    assert new_payload["input"][2]["output"] == "kept words <<ccr:test>>"
     assert new_payload["input"][3]["content"][0]["text"] == long_text
     assert any(t.startswith("router:openai:responses:") for t in transforms)
     assert units_by_category == {"applied": 1}
@@ -189,7 +189,7 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
 
     def compress(self, content: str, **_kwargs):
         return RouterCompressionResult(
-            compressed="custom output summary",
+            compressed="custom output summary <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -218,7 +218,7 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
 
     assert modified is True
     assert saved > 0
-    assert new_payload["input"][0]["output"] == "custom output summary"
+    assert new_payload["input"][0]["output"] == "custom output summary <<ccr:test>>"
     assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
     assert strategy_chain == []
@@ -324,7 +324,7 @@ def test_openai_responses_adapter_compresses_user_messages_only_with_user_opt_in
     assert units_by_category == {"applied": 1}
 
 
-def test_openai_responses_header_opt_in_compresses_old_user_and_protects_recent_messages():
+def test_openai_responses_header_opt_in_compresses_old_user_and_protects_recent_items():
     handler = _handler_with_router(ContentRouter())
     handler.config.protect_recent = 2
     old_text = _long_message_text("old user")
@@ -370,18 +370,64 @@ def test_openai_responses_header_opt_in_compresses_old_user_and_protects_recent_
     assert modified is True
     assert saved > 0
     assert new_payload["input"][0]["content"][0]["text"] != old_text
-    assert new_payload["input"][3]["content"][0]["text"] == recent_one
+    assert new_payload["input"][3]["content"][0]["text"] != recent_one
+    assert new_payload["input"][4] == original["input"][4]
     assert new_payload["input"][5]["content"][0]["text"] == recent_two
     assert "router:openai:responses:message:text_crusher" in transforms
-    assert units_by_category == {"applied": 1, "size_floor": 1}
+    assert units_by_category == {"applied": 2}
     # Only the old message text slot may change. Function pairing, item ids,
     # reasoning objects, ordering, and protected recent messages stay byte-shape equal.
     assert [item.get("id") for item in new_payload["input"]] == [
         item.get("id") for item in original["input"]
     ]
-    assert new_payload["input"][1:] == original["input"][1:]
+    assert new_payload["input"][1:3] == original["input"][1:3]
+    assert new_payload["input"][4:] == original["input"][4:]
     assert new_payload["input"][0]["id"] == original["input"][0]["id"]
     assert new_payload["input"][0]["role"] == original["input"][0]["role"]
+
+
+def test_openai_responses_protect_recent_includes_tool_outputs():
+    router = ContentRouter()
+    calls = []
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        return RouterCompressionResult(
+            compressed="tool summary <<ccr:test>>",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    handler.config.protect_recent = 2
+    outputs = [" ".join(f"tool{index}_{token}" for token in range(180)) for index in range(3)]
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": f"call_{index}",
+                "output": output,
+            }
+            for index, output in enumerate(outputs)
+        ],
+    }
+
+    new_payload, modified, saved, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_tool_protect_recent",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert calls == [outputs[0]]
+    assert new_payload["input"][0]["output"] == "tool summary <<ccr:test>>"
+    assert new_payload["input"][1]["output"] == outputs[1]
+    assert new_payload["input"][2]["output"] == outputs[2]
 
 
 def test_openai_responses_protect_recent_zero_compresses_latest_user_deterministically():
@@ -459,7 +505,7 @@ def test_openai_responses_adapter_compresses_array_input_text_output():
 
     def compress(self, content: str, **_kwargs):
         return RouterCompressionResult(
-            compressed="custom output summary",
+            compressed="custom output summary <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -496,7 +542,7 @@ def test_openai_responses_adapter_compresses_array_input_text_output():
     assert saved > 0
     output = new_payload["input"][0]["output"]
     assert output[0]["text"] == metadata
-    assert output[1]["text"] == "custom output summary"
+    assert output[1]["text"] == "custom output summary <<ccr:test>>"
     assert output[2] == image_part
     assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
     assert units_by_category == {"size_floor": 1, "applied": 1}
@@ -508,7 +554,7 @@ def test_openai_responses_adapter_compresses_output_text_content_parts():
 
     def compress(self, content: str, **_kwargs):
         return RouterCompressionResult(
-            compressed="content part output summary",
+            compressed="content part output summary <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -538,7 +584,7 @@ def test_openai_responses_adapter_compresses_output_text_content_parts():
     assert modified is True
     assert saved > 0
     assert new_payload["input"][0]["output"] == [
-        {"type": "output_text", "text": "content part output summary"}
+        {"type": "output_text", "text": "content part output summary <<ccr:test>>"}
     ]
     assert "router:openai:responses:function_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
@@ -557,7 +603,7 @@ def test_openai_responses_adapter_batches_small_outputs_once():
         calls.append(content)
         compressed = content
         for output in outputs:
-            compressed = compressed.replace(output, "x")
+            compressed = compressed.replace(output, "x <<ccr:test>>")
         return RouterCompressionResult(
             compressed=compressed,
             original=content,
@@ -592,7 +638,7 @@ def test_openai_responses_adapter_batches_small_outputs_once():
     assert saved > 0
     assert attempted == 120
     assert units_by_category == {"applied": 4}
-    assert [item["output"] for item in new_payload["input"]] == ["x"] * 4
+    assert [item["output"] for item in new_payload["input"]] == ["x <<ccr:test>>"] * 4
 
 
 def test_openai_responses_adapter_batches_small_array_parts_without_touching_images():
@@ -602,7 +648,7 @@ def test_openai_responses_adapter_batches_small_array_parts_without_touching_ima
     def compress(self, content: str, **_kwargs):
         calls["count"] += 1
         return RouterCompressionResult(
-            compressed=content.replace("word " * 30, "x"),
+            compressed=content.replace("word " * 30, "x <<ccr:test>>"),
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -639,7 +685,7 @@ def test_openai_responses_adapter_batches_small_array_parts_without_touching_ima
     assert modified is True
     assert saved > 0
     output = new_payload["input"][0]["output"]
-    assert [output[index]["text"] for index in (0, 2, 3, 4)] == ["x"] * 4
+    assert [output[index]["text"] for index in (0, 2, 3, 4)] == ["x <<ccr:test>>"] * 4
     assert output[1] == image_part
 
 
@@ -692,7 +738,7 @@ def test_openai_responses_adapter_reuses_exact_tool_output_cache():
     def compress(self, content: str, **_kwargs):
         calls["count"] += 1
         return RouterCompressionResult(
-            compressed="cached output summary",
+            compressed="cached output summary <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -735,8 +781,8 @@ def test_openai_responses_adapter_reuses_exact_tool_output_cache():
     assert modified_two is True
     assert saved_one > 0
     assert saved_two == saved_one
-    assert new_payload_one["input"][0]["output"] == "cached output summary"
-    assert new_payload_two["input"][1]["output"] == "cached output summary"
+    assert new_payload_one["input"][0]["output"] == "cached output summary <<ccr:test>>"
+    assert new_payload_two["input"][1]["output"] == "cached output summary <<ccr:test>>"
 
 
 def test_openai_responses_adapter_reuses_identical_tool_output_in_same_request():
@@ -746,7 +792,7 @@ def test_openai_responses_adapter_reuses_identical_tool_output_in_same_request()
     def compress(self, content: str, **_kwargs):
         calls["count"] += 1
         return RouterCompressionResult(
-            compressed="same request cached summary",
+            compressed="same request cached summary <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -774,8 +820,8 @@ def test_openai_responses_adapter_reuses_identical_tool_output_in_same_request()
     assert modified is True
     assert saved > 0
     assert [item["output"] for item in new_payload["input"]] == [
-        "same request cached summary",
-        "same request cached summary",
+        "same request cached summary <<ccr:test>>",
+        "same request cached summary <<ccr:test>>",
     ]
 
 
@@ -796,7 +842,7 @@ def test_openai_responses_adapter_parallelizes_cache_misses_preserving_order(mon
         try:
             marker = content.rsplit(" marker", 1)[1]
             return RouterCompressionResult(
-                compressed=f"summary marker{marker}",
+                compressed=f"summary marker{marker} <<ccr:test>>",
                 original=content,
                 strategy_used=CompressionStrategy.KOMPRESS,
             )
@@ -834,10 +880,10 @@ def test_openai_responses_adapter_parallelizes_cache_misses_preserving_order(mon
     assert modified is True
     assert saved > 0
     assert [item["output"] for item in new_payload["input"]] == [
-        "summary marker0",
-        "summary marker1",
-        "summary marker2",
-        "summary marker3",
+        "summary marker0 <<ccr:test>>",
+        "summary marker1 <<ccr:test>>",
+        "summary marker2 <<ccr:test>>",
+        "summary marker3 <<ccr:test>>",
     ]
 
 
@@ -1201,7 +1247,7 @@ def test_openai_responses_adapter_compresses_non_excluded_tool_outputs():
 
     def compress(self, content: str, **_kwargs):
         return RouterCompressionResult(
-            compressed="compressed tool output",
+            compressed="compressed tool output <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -1236,7 +1282,7 @@ def test_openai_responses_adapter_compresses_non_excluded_tool_outputs():
 
     assert modified is True
     assert saved > 0
-    assert new_payload["input"][1]["output"] == "compressed tool output"
+    assert new_payload["input"][1]["output"] == "compressed tool output <<ccr:test>>"
     assert "router:openai:responses:function_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
 
@@ -1284,7 +1330,7 @@ def test_openai_responses_payload_routes_through_content_router_without_rust(
 
     def compress(self, content: str, **_kwargs):
         return RouterCompressionResult(
-            compressed="compressed fallback",
+            compressed="compressed fallback <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -1321,8 +1367,89 @@ def test_openai_responses_payload_routes_through_content_router_without_rust(
     assert modified is True
     assert saved > 0
     assert reason is None
-    assert new_payload["input"][0]["output"] == "compressed fallback"
+    assert new_payload["input"][0]["output"] == "compressed fallback <<ccr:test>>"
     assert any(t.startswith("router:openai:responses:") for t in transforms)
+
+
+def test_previous_response_id_uses_incremental_lossless_router(monkeypatch):
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_LOSSLESS", raising=False)
+    router = ContentRouter()
+    calls = []
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        return RouterCompressionResult(
+            compressed="lossy summary <<ccr:test>>",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    output = " ".join(f"incremental_{index}" for index in range(180))
+    payload = {
+        "model": "gpt-5",
+        "previous_response_id": "resp_previous",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": output,
+            }
+        ],
+    }
+
+    new_payload, modified, saved, *_ = handler._compress_openai_responses_payload(
+        payload,
+        model="gpt-5",
+        request_id="req_incremental_default",
+    )
+
+    assert modified is False
+    assert saved == 0
+    assert calls == []
+    assert new_payload["input"][0]["output"] == output
+    assert "<<ccr:" not in new_payload["input"][0]["output"]
+
+
+def test_incremental_lossless_env_zero_restores_lossy_router(monkeypatch):
+    monkeypatch.setenv("HEADROOM_INCREMENTAL_LOSSLESS", "0")
+    router = ContentRouter()
+    calls = []
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        return RouterCompressionResult(
+            compressed="old behavior summary <<ccr:test>>",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    output = " ".join(f"incremental_{index}" for index in range(180))
+    payload = {
+        "model": "gpt-5",
+        "previous_response_id": "resp_previous",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": output,
+            }
+        ],
+    }
+
+    new_payload, modified, saved, *_ = handler._compress_openai_responses_payload(
+        payload,
+        model="gpt-5",
+        request_id="req_incremental_opt_out",
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert calls == [output]
+    assert new_payload["input"][0]["output"] == "old behavior summary <<ccr:test>>"
 
 
 def test_openai_responses_adapter_batches_small_tool_outputs_before_floor():
@@ -1342,7 +1469,7 @@ def test_openai_responses_adapter_batches_small_tool_outputs_before_floor():
         calls.append(content)
         compressed = content
         for output in outputs:
-            compressed = compressed.replace(output, "tiny summary")
+            compressed = compressed.replace(output, "tiny summary <<ccr:test>>")
         return RouterCompressionResult(
             compressed=compressed,
             original=content,
@@ -1388,7 +1515,7 @@ def test_openai_responses_adapter_batches_small_tool_outputs_before_floor():
     # No unit should be size-floored; every extracted unit is compressed.
     assert "size_floor" not in units_by_category
     assert units_by_category == {"applied": len(outputs)}
-    assert all(item["output"] == "tiny summary" for item in new_payload["input"])
+    assert all(item["output"] == "tiny summary <<ccr:test>>" for item in new_payload["input"])
 
 
 def test_openai_responses_adapter_floors_when_aggregate_below_threshold():

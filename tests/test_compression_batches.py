@@ -51,7 +51,7 @@ class _ShorteningRouter:
     def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
         self.calls += 1
         return RouterCompressionResult(
-            compressed=content.replace("x" * 150, "x"),
+            compressed=content.replace("x" * 150, "x <<ccr:test>>"),
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -70,7 +70,7 @@ def test_batch_compresses_entries_with_one_router_call():
 
     assert router.calls == 1
     assert [slot for slot, _ in results] == [entry.routed.slot for entry in entries]
-    assert [result.compressed for _, result in results] == ["x"] * 4
+    assert [result.compressed for _, result in results] == ["x <<ccr:test>>"] * 4
     assert all(result.modified for _, result in results)
 
 
@@ -209,7 +209,7 @@ def test_batch_rejects_ccr_marker_moved_to_another_entry():
 class _CjkShorteningRouter:
     def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
         return RouterCompressionResult(
-            compressed=content.replace("你" * 150, "短"),
+            compressed=content.replace("你" * 150, "短 <<ccr:test>>"),
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -228,4 +228,4 @@ def test_batch_uses_utf8_bytes_for_cjk_small_units():
     assert skipped == []
     assert batches[0].text_bytes == 1800
     assert all(result.modified for _, result in results)
-    assert [result.compressed for _, result in results] == ["短"] * 4
+    assert [result.compressed for _, result in results] == ["短 <<ccr:test>>"] * 4

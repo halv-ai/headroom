@@ -50,6 +50,11 @@ def _handler_with_router(router: ContentRouter) -> OpenAIHandlerMixin:
     handler.openai_provider = SimpleNamespace(
         get_token_counter=lambda _model: TokenCounter(),
     )
+    handler.config = SimpleNamespace(
+        compress_responses_messages=False,
+        compress_user_messages=False,
+        protect_recent=0,
+    )
     return handler
 
 
@@ -114,7 +119,7 @@ def test_t3_failed_size_responses_payload_parallelizes_uncached_tool_outputs(mon
         try:
             marker = content.split(" tool=", 1)[1].split(" ", 1)[0]
             return RouterCompressionResult(
-                compressed=f"summary for tool={marker}",
+                compressed=f"summary for tool={marker} <<ccr:test>>",
                 original=content,
                 strategy_used=CompressionStrategy.KOMPRESS,
             )
@@ -147,7 +152,7 @@ def test_t3_failed_size_responses_payload_parallelizes_uncached_tool_outputs(mon
         for item in new_payload["input"]
         if item.get("type") == "function_call_output"
     ]
-    assert outputs == [f"summary for tool={index}" for index in range(case.unit_count)]
+    assert outputs == [f"summary for tool={index} <<ccr:test>>" for index in range(case.unit_count)]
 
 
 def test_t3_failed_size_exact_tool_output_cache_survives_history_changes():
@@ -159,7 +164,7 @@ def test_t3_failed_size_exact_tool_output_cache_survives_history_changes():
         calls["count"] += 1
         marker = content.split(" tool=", 1)[1].split(" ", 1)[0]
         return RouterCompressionResult(
-            compressed=f"cached summary for tool={marker}",
+            compressed=f"cached summary for tool={marker} <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -205,12 +210,12 @@ def test_t3_failed_size_exact_tool_output_cache_survives_history_changes():
         item["output"]
         for item in first_new_payload["input"]
         if item.get("type") == "function_call_output"
-    ] == [f"cached summary for tool={index}" for index in range(case.unit_count)]
+    ] == [f"cached summary for tool={index} <<ccr:test>>" for index in range(case.unit_count)]
     assert [
         item["output"]
         for item in second_new_payload["input"]
         if item.get("type") == "function_call_output"
     ] == [
-        *[f"cached summary for tool={index}" for index in range(case.unit_count)],
-        f"cached summary for tool={case.unit_count}",
+        *[f"cached summary for tool={index} <<ccr:test>>" for index in range(case.unit_count)],
+        f"cached summary for tool={case.unit_count} <<ccr:test>>",
     ]

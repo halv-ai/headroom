@@ -108,7 +108,7 @@ def test_resolve_codex_routing_ignores_invalid_jwt_payloads():
     assert headers["authorization"] == f"Bearer {token}"
 
 
-def test_openai_responses_unit_cache_key_includes_target_ratio() -> None:
+def test_openai_responses_unit_cache_key_includes_recoverability_inputs() -> None:
     unit = SimpleNamespace(
         text="large tool output",
         provider="openai",
@@ -135,9 +135,14 @@ def test_openai_responses_unit_cache_key_includes_target_ratio() -> None:
         model="gpt-5.4",
         target_ratio=0.50,
     )
+    unit.retrieval_available = True
+    retrieval_key = _openai_responses_unit_cache_key(unit, model="gpt-5.4")
+    unit.retrieval_available = False
+    no_retrieval_key = _openai_responses_unit_cache_key(unit, model="gpt-5.4")
 
     assert aggressive_key != default_key
     assert aggressive_key != balanced_key
+    assert retrieval_key != no_retrieval_key
 
 
 def test_responses_message_env_config_keeps_user_gate_independent(monkeypatch) -> None:

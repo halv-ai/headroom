@@ -224,6 +224,11 @@ class _HandlerHarness(OpenAIHandlerMixin):
     def __init__(self, router: ContentRouter):
         self.openai_pipeline: Any = _StubPipeline(router)
         self.openai_provider: Any = _StubProvider()
+        self.config = SimpleNamespace(
+            compress_responses_messages=False,
+            compress_user_messages=False,
+            protect_recent=0,
+        )
 
 
 def test_codex_input_list_payload_reaches_router_without_skip() -> None:

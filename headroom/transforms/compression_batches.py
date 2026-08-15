@@ -8,13 +8,13 @@ from dataclasses import dataclass
 
 from .compression_units import (
     _CCR_MARKER_RE,
-    _LOSSY_UNMARKED_STRATEGIES,
     CompressionStrategy,
     ContentRouter,
     RoutedCompressionUnit,
     TokenCounterLike,
     UnitCompressionResult,
-    _is_structured_shell_output,
+    _is_unrecoverable_lossy_tool_output,
+    _router_strategy_is_lossless,
 )
 from .content_router import RouterCompressionResult
 from .tag_protector import protect_tags, restore_tags
@@ -54,6 +54,7 @@ def _compatibility_key(entry: CompressionBatchEntry) -> tuple[object, ...]:
         unit.context,
         unit.question,
         unit.bias,
+        unit.retrieval_available,
     )
 
 
@@ -303,12 +304,11 @@ def compress_batch_with_router(
         unit = entry.routed.unit
         tokens_before = tokenizer.count_text(unit.text)
         tokens_after = tokenizer.count_text(replacement)
-        if (
-            unit.role == "tool"
-            and unit.item_type == "local_shell_call_output"
-            and _is_structured_shell_output(unit.text)
-            and strategy in _LOSSY_UNMARKED_STRATEGIES
-            and not _CCR_MARKER_RE.search(replacement)
+        if _is_unrecoverable_lossy_tool_output(
+            unit,
+            replacement=replacement,
+            strategy=strategy,
+            lossless_only=_router_strategy_is_lossless(router, strategy),
         ):
             result = UnitCompressionResult(
                 original=unit.text,

@@ -88,6 +88,7 @@ logger = logging.getLogger("headroom.proxy")
 _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES = 10_000
 _OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v3"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_ENV = "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"
+_OPENAI_RESPONSES_INCREMENTAL_LOSSLESS_ENV = "HEADROOM_INCREMENTAL_LOSSLESS"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
 _OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
 _OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_ENV = "HEADROOM_COMPRESS_TOOL_OUTPUT_EXCLUDE"
@@ -105,6 +106,15 @@ _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
+
+
+def _openai_responses_incremental_lossless_enabled() -> bool:
+    """Return whether incremental Responses sessions use lossless compression."""
+
+    value = os.environ.get(_OPENAI_RESPONSES_INCREMENTAL_LOSSLESS_ENV)
+    if value is None:
+        return True
+    return value.lower() in ("true", "1", "yes", "on")
 
 
 def _openai_responses_tool_output_exclude_pattern() -> re.Pattern[str] | None:
@@ -499,6 +509,7 @@ def _openai_responses_unit_cache_key(
         "context": unit.context,
         "question": unit.question,
         "bias": unit.bias,
+        "retrieval_available": getattr(unit, "retrieval_available", True),
         "metadata": unit.metadata,
         "target_ratio": target_ratio,
         "text_sha256": text_hash,
@@ -1649,6 +1660,27 @@ class OpenAIHandlerMixin:
             while len(cache) > _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES:
                 cache.popitem(last=False)
 
+    def _openai_responses_lossless_router(self, router: Any) -> Any:
+        """Return a cached lossless router derived from the live router."""
+
+        cached = getattr(self, "_openai_responses_incremental_lossless_router", None)
+        if cached is not None and cached[0] is router:
+            return cached[1]
+
+        from headroom.transforms.content_router import ContentRouter
+
+        lossless_router = ContentRouter(
+            replace(
+                router.config,
+                lossless=True,
+                smart_crusher_lossless_only=True,
+                ccr_inject_marker=False,
+            ),
+            observer=getattr(router, "_observer", None),
+        )
+        self._openai_responses_incremental_lossless_router = (router, lossless_router)
+        return lossless_router
+
     def _compress_openai_responses_message_unit(
         self,
         unit: Any,
@@ -1925,6 +1957,8 @@ class OpenAIHandlerMixin:
         timing: dict[str, float] | None = None,
         compress_responses_messages: bool = False,
         protect_recent: int | None = None,
+        incremental_lossless: bool = False,
+        retrieval_available: bool = True,
         codex_ws_function_name_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
@@ -1979,6 +2013,9 @@ class OpenAIHandlerMixin:
         if router is None:
             logger.debug("[%s] OpenAI Responses ContentRouter unavailable", request_id)
             return payload, False, 0, [], {}, [], 0
+        tool_output_router = (
+            self._openai_responses_lossless_router(router) if incremental_lossless else router
+        )
         profile_kwargs = proxy_pipeline_kwargs(getattr(self, "config", None))
         effective_compress_responses_messages = bool(
             compress_responses_messages
@@ -1999,18 +2036,22 @@ class OpenAIHandlerMixin:
                 _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
             )
         )
-        message_protect_recent = _nonnegative_int_or_default(
+        response_protect_recent = _nonnegative_int_or_default(
             protect_recent_raw,
             _OPENAI_RESPONSES_PROTECT_RECENT_DEFAULT,
         )
-        message_indices = [
+        protectable_indices = [
             idx
             for idx, item in enumerate(items)
-            if isinstance(item, dict) and item.get("type") == "message"
+            if isinstance(item, dict)
+            and (
+                item.get("type") == "message"
+                or item.get("type") in self.OPENAI_RESPONSES_OUTPUT_TYPES
+            )
         ]
-        protected_message_indices = (
-            set(message_indices[-message_protect_recent:])
-            if effective_compress_responses_messages and message_protect_recent > 0
+        protected_recent_indices = (
+            set(protectable_indices[-response_protect_recent:])
+            if response_protect_recent > 0
             else set()
         )
         unit_target_ratio = profile_kwargs.get("target_ratio")
@@ -2181,6 +2222,19 @@ class OpenAIHandlerMixin:
                 continue
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
+                if idx in protected_recent_indices:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "recent_tool_output_protected",
+                                "protect_recent": response_protect_recent,
+                                "item_type": item_type,
+                                "item": item,
+                            }
+                        )
+                    continue
                 call_id = item.get("call_id")
                 if (
                     item_type == "function_call_output"
@@ -2310,14 +2364,14 @@ class OpenAIHandlerMixin:
                             }
                         )
             elif effective_compress_responses_messages and item_type == "message":
-                if idx in protected_message_indices:
+                if idx in protected_recent_indices:
                     if debug_enabled:
                         extraction_debug.append(
                             {
                                 "index": idx,
                                 "eligible": False,
                                 "reason": "recent_message_protected",
-                                "protect_recent": message_protect_recent,
+                                "protect_recent": response_protect_recent,
                                 "item_type": item_type,
                                 "role": item.get("role"),
                                 "item": item,
@@ -2472,6 +2526,8 @@ class OpenAIHandlerMixin:
             # ContentRouter remains the tool-output path; its Kompress candidate
             # is excluded here because readiness, semaphore saturation, and its
             # wall-clock deadline can change output for identical input.
+            if incremental_lossless and item_type != "message":
+                metadata["incremental_lossless"] = "true"
             unit = CompressionUnit(
                 text=original_text,
                 provider="openai",
@@ -2481,6 +2537,7 @@ class OpenAIHandlerMixin:
                 cache_zone="live",
                 mutable=True,
                 min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                retrieval_available=retrieval_available,
                 metadata=metadata,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
@@ -2540,7 +2597,7 @@ class OpenAIHandlerMixin:
             else:
                 result = compress_unit_with_router(
                     routed.unit,
-                    router=router,
+                    router=tool_output_router,
                     tokenizer=tokenizer,
                     target_ratio=unit_target_ratio,
                 )
@@ -2568,9 +2625,7 @@ class OpenAIHandlerMixin:
                         strategy="passthrough",
                         reason="content_exempt",
                         router_result=None,
-                        text_bytes=len(
-                            routed.unit.text.encode("utf-8", errors="replace")
-                        ),
+                        text_bytes=len(routed.unit.text.encode("utf-8", errors="replace")),
                         min_bytes=routed.unit.min_bytes,
                         reason_category="content_exempt",
                     ),
@@ -2655,9 +2710,12 @@ class OpenAIHandlerMixin:
 
         def _compress_batch(batch: Any) -> tuple[list[tuple[object, Any]], float]:
             batch_started = time.perf_counter()
+            batch_router = router
+            if batch.entries and batch.entries[0].routed.unit.item_type != "message":
+                batch_router = tool_output_router
             results = compress_batch_with_router(
                 batch,
-                router=router,
+                router=batch_router,
                 tokenizer=tokenizer,
                 target_ratio=unit_target_ratio,
             )
@@ -2864,6 +2922,7 @@ class OpenAIHandlerMixin:
         protect_recent: int | None = None,
         client: str | None = None,
         preserve_tools: bool = False,
+        incremental_lossless: bool = False,
         codex_ws_function_name_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
@@ -2875,6 +2934,9 @@ class OpenAIHandlerMixin:
         """
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
+        effective_incremental_lossless = _openai_responses_incremental_lossless_enabled() and (
+            incremental_lossless or "previous_response_id" in payload
+        )
 
         def _add_timing(name: str, started_at: float) -> None:
             timing_sink[name] = (
@@ -3092,6 +3154,8 @@ class OpenAIHandlerMixin:
             timing=timing_sink,
             compress_responses_messages=compress_responses_messages,
             protect_recent=protect_recent,
+            incremental_lossless=effective_incremental_lossless,
+            retrieval_available=not preserve_tools,
             codex_ws_function_name_by_call_id=codex_ws_function_name_by_call_id,
         )
         _add_timing("compression_live_units_total", live_units_started)
@@ -3217,6 +3281,7 @@ class OpenAIHandlerMixin:
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
         preserve_tools: bool = False,
+        incremental_lossless: bool = False,
         codex_ws_function_name_by_call_id: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
@@ -3231,6 +3296,8 @@ class OpenAIHandlerMixin:
             compression_kwargs["protect_recent"] = protect_recent
         if preserve_tools:
             compression_kwargs["preserve_tools"] = True
+        if incremental_lossless:
+            compression_kwargs["incremental_lossless"] = True
         if codex_ws_function_name_by_call_id is not None:
             compression_kwargs["codex_ws_function_name_by_call_id"] = (
                 codex_ws_function_name_by_call_id
@@ -3262,6 +3329,7 @@ class OpenAIHandlerMixin:
                                 "codex_ws_function_name_by_call_id",
                                 "client",
                                 "preserve_tools",
+                                "incremental_lossless",
                                 "timing",
                                 "protect_recent",
                                 "compress_responses_messages",
@@ -7399,6 +7467,7 @@ class OpenAIHandlerMixin:
                                 else COMPRESSION_TIMEOUT_SECONDS,
                                 client=client,
                                 preserve_tools=client == "codex",
+                                incremental_lossless=client == "codex",
                                 codex_ws_function_name_by_call_id=dict(
                                     codex_ws_function_name_by_call_id
                                 ),
@@ -7723,6 +7792,7 @@ class OpenAIHandlerMixin:
                                     else COMPRESSION_TIMEOUT_SECONDS,
                                     client=client,
                                     preserve_tools=client == "codex",
+                                    incremental_lossless=client == "codex",
                                     codex_ws_function_name_by_call_id=dict(
                                         codex_ws_function_name_by_call_id
                                     ),

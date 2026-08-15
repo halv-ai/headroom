@@ -23,7 +23,7 @@ def _handler() -> OpenAIHandlerMixin:
 
     def compress(self, content: str, **_kwargs):
         return RouterCompressionResult(
-            compressed="compressed output",
+            compressed="compressed output <<ccr:test>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -37,7 +37,7 @@ def _handler() -> OpenAIHandlerMixin:
     handler.config = SimpleNamespace(
         compress_responses_messages=False,
         compress_user_messages=False,
-        protect_recent=None,
+        protect_recent=0,
     )
     return handler
 
@@ -97,7 +97,7 @@ def test_shell_tool_output_still_compresses(monkeypatch):
 
     assert modified is True
     assert saved > 0
-    assert new_payload["input"][1]["output"] == "compressed output"
+    assert new_payload["input"][1]["output"] == "compressed output <<ccr:test>>"
     assert EXEMPT_TRANSFORM not in transforms
     assert "router:openai:responses:function_call_output:kompress" in transforms
 
@@ -110,7 +110,7 @@ def test_unresolvable_call_id_still_compresses(monkeypatch):
 
     assert modified is True
     assert saved > 0
-    assert new_payload["input"][0]["output"] == "compressed output"
+    assert new_payload["input"][0]["output"] == "compressed output <<ccr:test>>"
     assert EXEMPT_TRANSFORM not in transforms
     assert "router:openai:responses:function_call_output:kompress" in transforms
 
@@ -133,5 +133,5 @@ def test_custom_regex_override_and_empty_value(monkeypatch):
 
     assert compressed_modified is True
     assert compressed_saved > 0
-    assert compressed_payload["input"][1]["output"] == "compressed output"
+    assert compressed_payload["input"][1]["output"] == "compressed output <<ccr:test>>"
     assert EXEMPT_TRANSFORM not in compressed_transforms

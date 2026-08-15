@@ -39,6 +39,7 @@ class CompressionUnit:
     question: str | None = None
     bias: float = 1.0
     min_bytes: int = 512
+    retrieval_available: bool = True
     metadata: dict[str, str] = field(default_factory=dict)
 
 
@@ -112,14 +113,51 @@ _CCR_MARKER_RE = re.compile(
 
 _LOSSY_UNMARKED_STRATEGIES = {
     CompressionStrategy.KOMPRESS.value,
+    CompressionStrategy.SMART_CRUSHER.value,
     CompressionStrategy.TEXT.value,
     CompressionStrategy.CODE_AWARE.value,
 }
 
+_RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
+    {
+        "custom_tool_call_output",
+        "function_call_output",
+        "local_shell_call_output",
+        "apply_patch_call_output",
+    }
+)
 
-def _is_structured_shell_output(text: str) -> bool:
-    nonempty_lines = [line for line in text.splitlines() if line.strip()]
-    return len(nonempty_lines) >= 3
+
+def _router_strategy_is_lossless(router: object, strategy: str) -> bool:
+    config = getattr(router, "config", None)
+    return bool(
+        getattr(config, "lossless", False)
+        or (
+            strategy == CompressionStrategy.SMART_CRUSHER.value
+            and getattr(config, "smart_crusher_lossless_only", False)
+        )
+    )
+
+
+def _is_unrecoverable_lossy_tool_output(
+    unit: CompressionUnit,
+    *,
+    replacement: str,
+    strategy: str,
+    lossless_only: bool = False,
+) -> bool:
+    """Return whether a Responses tool-output replacement loses data."""
+
+    if (
+        unit.role != "tool"
+        or unit.item_type not in _RESPONSES_OUTPUT_ITEM_TYPES
+        or strategy not in _LOSSY_UNMARKED_STRATEGIES
+    ):
+        return False
+    has_marker = _CCR_MARKER_RE.search(replacement) is not None
+    if lossless_only:
+        return has_marker
+    return not unit.retrieval_available or not has_marker
 
 
 def find_content_router(transforms: object) -> ContentRouter | None:
@@ -336,18 +374,17 @@ def compress_unit_with_router(
             reason="rejected_not_smaller",
         )
 
-    if (
-        unit.role == "tool"
-        and unit.item_type == "local_shell_call_output"
-        and _is_structured_shell_output(unit.text)
-        and strategy in _LOSSY_UNMARKED_STRATEGIES
+    if _is_unrecoverable_lossy_tool_output(
+        unit,
+        replacement=replacement,
+        strategy=strategy,
+        lossless_only=_router_strategy_is_lossless(router, strategy),
     ):
-        if not _CCR_MARKER_RE.search(replacement):
-            return _with_reason(
-                strategy=strategy,
-                router_result=router_result,
-                reason="lossy_unrecoverable_tool_output",
-            )
+        return _with_reason(
+            strategy=strategy,
+            router_result=router_result,
+            reason="lossy_unrecoverable_tool_output",
+        )
 
     return UnitCompressionResult(
         original=unit.text,

@@ -782,6 +782,7 @@ async def test_ws_later_response_create_frame_uses_shared_compression(monkeypatc
 
 @pytest.mark.asyncio
 async def test_ws_scip_tool_output_skips_cached_shell_variant(monkeypatch):
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_LOSSLESS", raising=False)
     monkeypatch.delenv("HEADROOM_COMPRESS_TOOL_OUTPUT_EXCLUDE", raising=False)
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
     large_output = _large_tool_output()
@@ -799,6 +800,7 @@ async def test_ws_scip_tool_output_skips_cached_shell_variant(monkeypatch):
     )
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.config.protect_recent = 0
     router = ContentRouter()
     router.config.exclude_tools = set()
     outcomes = []
@@ -823,17 +825,16 @@ async def test_ws_scip_tool_output_skips_cached_shell_variant(monkeypatch):
     with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
         await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
 
-    assert json.loads(upstream.sent[1])["response"]["input"][0]["output"] == (
-        "compressed shell output"
-    )
+    assert json.loads(upstream.sent[1])["response"]["input"][0]["output"] == large_output
     assert upstream.sent[3] == scip_output_frame
-    assert compressed_contents == [large_output]
+    assert compressed_contents == []
     assert outcomes
     assert CODEX_WS_EXEMPT_TRANSFORM in outcomes[-1].transforms_applied
 
 
 @pytest.mark.asyncio
-async def test_ws_shell_tool_output_still_compresses_across_frames(monkeypatch):
+async def test_ws_shell_tool_output_is_lossless_across_frames(monkeypatch):
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_LOSSLESS", raising=False)
     monkeypatch.delenv("HEADROOM_COMPRESS_TOOL_OUTPUT_EXCLUDE", raising=False)
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
     call_id = "call_shell"
@@ -849,6 +850,7 @@ async def test_ws_shell_tool_output_still_compresses_across_frames(monkeypatch):
     )
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.config.protect_recent = 0
     router = ContentRouter()
     router.config.exclude_tools = set()
     outcomes = []
@@ -872,13 +874,14 @@ async def test_ws_shell_tool_output_still_compresses_across_frames(monkeypatch):
         await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
 
     forwarded_output = json.loads(upstream.sent[1])["response"]["input"][0]["output"]
-    assert forwarded_output == "compressed shell output"
-    assert outcomes[-1].tokens_saved > 0
+    assert forwarded_output == _large_tool_output()
+    assert outcomes[-1].tokens_saved == 0
     assert CODEX_WS_EXEMPT_TRANSFORM not in outcomes[-1].transforms_applied
 
 
 @pytest.mark.asyncio
 async def test_ws_custom_tool_output_content_signature_is_byte_identical(monkeypatch):
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_LOSSLESS", raising=False)
     monkeypatch.delenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", raising=False)
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
     crux_output = "\n".join(
@@ -894,6 +897,7 @@ async def test_ws_custom_tool_output_content_signature_is_byte_identical(monkeyp
     client_ws = _FakeWebSocket(frames=[original_frame])
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.config.protect_recent = 0
     router = ContentRouter()
     router.config.exclude_tools = set()
     outcomes = []
@@ -920,7 +924,9 @@ async def test_ws_custom_tool_output_content_signature_is_byte_identical(monkeyp
     assert outcomes
     assert CONTENT_EXEMPT_TRANSFORM in outcomes[-1].transforms_applied
     assert not hasattr(handler, "_openai_responses_unit_result_cache")
-    unit_events = [payload for event, payload in debug_events if event == "codex_compression_unit_result"]
+    unit_events = [
+        payload for event, payload in debug_events if event == "codex_compression_unit_result"
+    ]
     assert len(unit_events) == 1
     assert unit_events[0]["original"] == crux_output
     assert unit_events[0]["compressed"] == crux_output
@@ -928,7 +934,8 @@ async def test_ws_custom_tool_output_content_signature_is_byte_identical(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_ws_shell_looking_custom_tool_output_still_compresses(monkeypatch):
+async def test_ws_custom_tool_output_uses_incremental_lossless_mode(monkeypatch):
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_LOSSLESS", raising=False)
     monkeypatch.delenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", raising=False)
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
     build_output = "\n".join(
@@ -937,19 +944,23 @@ async def test_ws_shell_looking_custom_tool_output_still_compresses(monkeypatch)
             *(f"build log line {index}: compiled target module_{index}" for index in range(400)),
         ]
     )
+    assert len(build_output.encode("utf-8")) > 512
     original_frame = _custom_tool_output_frame([("call_exec", build_output)])
     upstream = _FakeUpstream([_completed_response_event()])
     client_ws = _FakeWebSocket(frames=[original_frame])
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.config.protect_recent = 0
     router = ContentRouter()
     router.config.exclude_tools = set()
     outcomes = []
+    lossy_calls = []
 
     async def _record_request_outcome(outcome):
         outcomes.append(outcome)
 
     def _compress(self, content: str, **_kwargs):
+        lossy_calls.append(content)
         return RouterCompressionResult(
             compressed="compressed build log",
             original=content,
@@ -964,13 +975,17 @@ async def test_ws_shell_looking_custom_tool_output_still_compresses(monkeypatch)
         await handler.handle_openai_responses_ws(client_ws)
 
     forwarded = json.loads(upstream.sent[0])
-    assert forwarded["response"]["input"][0]["output"] == "compressed build log"
-    assert outcomes[-1].tokens_saved > 0
+    forwarded_output = forwarded["response"]["input"][0]["output"]
+    assert forwarded_output == build_output
+    assert "<<ccr:" not in forwarded_output
+    assert lossy_calls == []
+    assert outcomes[-1].tokens_saved == 0
     assert CONTENT_EXEMPT_TRANSFORM not in outcomes[-1].transforms_applied
 
 
 @pytest.mark.asyncio
 async def test_ws_content_signature_env_override_changes_exempt_output(monkeypatch):
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_LOSSLESS", raising=False)
     monkeypatch.setenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", r"^KEEP EXACT:")
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
     override_output = "KEEP EXACT:\n" + "\n".join(
@@ -989,6 +1004,7 @@ async def test_ws_content_signature_env_override_changes_exempt_output(monkeypat
     client_ws = _FakeWebSocket(frames=[original_frame])
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.config.protect_recent = 0
     router = ContentRouter()
     router.config.exclude_tools = set()
     compressed_contents = []
@@ -1014,13 +1030,14 @@ async def test_ws_content_signature_env_override_changes_exempt_output(monkeypat
 
     forwarded_items = json.loads(upstream.sent[0])["response"]["input"]
     assert forwarded_items[0]["output"] == override_output
-    assert forwarded_items[1]["output"] == "compressed default-signature output"
-    assert compressed_contents == [default_signature_output]
+    assert forwarded_items[1]["output"] == default_signature_output
+    assert compressed_contents == []
     assert CONTENT_EXEMPT_TRANSFORM in outcomes[-1].transforms_applied
 
 
 @pytest.mark.asyncio
 async def test_ws_empty_content_signature_disables_guard(monkeypatch):
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_LOSSLESS", raising=False)
     monkeypatch.setenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", "")
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
     output = "resolved make_model_tuple → `x`/make_model_tuple().\n" + "\n".join(
@@ -1031,6 +1048,7 @@ async def test_ws_empty_content_signature_disables_guard(monkeypatch):
     client_ws = _FakeWebSocket(frames=[original_frame])
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.config.protect_recent = 0
     router = ContentRouter()
     router.config.exclude_tools = set()
     outcomes = []
@@ -1053,7 +1071,7 @@ async def test_ws_empty_content_signature_disables_guard(monkeypatch):
         await handler.handle_openai_responses_ws(client_ws)
 
     forwarded = json.loads(upstream.sent[0])
-    assert forwarded["response"]["input"][0]["output"] == "compressed disabled-guard output"
+    assert forwarded["response"]["input"][0]["output"] == output
     assert CONTENT_EXEMPT_TRANSFORM not in outcomes[-1].transforms_applied
 
 
@@ -1062,6 +1080,7 @@ async def test_ws_invalid_content_signature_warns_and_uses_default(
     caplog,
     monkeypatch,
 ):
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_LOSSLESS", raising=False)
     monkeypatch.setenv("HEADROOM_COMPRESS_CONTENT_EXCLUDE", "[")
     monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
     output = "definition: path.py:12\n" + "\n".join(
@@ -1072,6 +1091,7 @@ async def test_ws_invalid_content_signature_warns_and_uses_default(
     client_ws = _FakeWebSocket(frames=[original_frame])
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.config.protect_recent = 0
     router = ContentRouter()
     router.config.exclude_tools = set()
     outcomes = []

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from headroom.transforms.compression_units import (
     CompressionUnit,
     RoutedCompressionUnit,
@@ -18,14 +20,22 @@ class TokenCounter:
 
 
 class Router:
-    def __init__(self, compressed: str):
+    def __init__(
+        self,
+        compressed: str,
+        strategy: CompressionStrategy = CompressionStrategy.KOMPRESS,
+        *,
+        lossless: bool = False,
+    ):
         self.compressed = compressed
+        self.strategy = strategy
+        self.config = SimpleNamespace(lossless=lossless)
 
     def compress(self, content: str, **_kwargs):
         return RouterCompressionResult(
             compressed=self.compressed,
             original=content,
-            strategy_used=CompressionStrategy.KOMPRESS,
+            strategy_used=self.strategy,
         )
 
 
@@ -44,7 +54,7 @@ def test_compression_unit_uses_utf8_bytes_for_floor():
             item_type="function_call_output",
             min_bytes=512,
         ),
-        router=Router("短"),
+        router=Router("短 <<ccr:test>>"),
         tokenizer=CharacterCounter(),
     )
 
@@ -118,7 +128,7 @@ def test_compression_unit_accepts_lossy_tool_output_when_recoverable():
     assert result.compressed == "summary <<ccr:abc123>>"
 
 
-def test_compression_unit_still_compresses_non_shell_tool_output():
+def test_compression_unit_keeps_unmarked_non_shell_tool_output_verbatim():
     result = compress_unit_with_router(
         CompressionUnit(
             text="alpha beta gamma delta epsilon zeta eta theta",
@@ -132,9 +142,58 @@ def test_compression_unit_still_compresses_non_shell_tool_output():
         tokenizer=TokenCounter(),
     )
 
+    assert result.modified is False
+    assert result.reason == "lossy_unrecoverable_tool_output"
+    assert result.compressed == result.original
+
+
+def test_compression_unit_rejects_marked_smart_crusher_without_retrieval():
+    original = "alpha beta gamma delta epsilon zeta eta theta"
+    result = compress_unit_with_router(
+        CompressionUnit(
+            text=original,
+            provider="openai",
+            endpoint="responses",
+            role="tool",
+            item_type="custom_tool_call_output",
+            min_bytes=1,
+            retrieval_available=False,
+        ),
+        router=Router(
+            "summary <<ccr:abc123>>",
+            strategy=CompressionStrategy.SMART_CRUSHER,
+        ),
+        tokenizer=TokenCounter(),
+    )
+
+    assert result.modified is False
+    assert result.reason == "lossy_unrecoverable_tool_output"
+    assert result.compressed == original
+
+
+def test_compression_unit_accepts_incremental_lossless_fold_without_retrieval():
+    result = compress_unit_with_router(
+        CompressionUnit(
+            text="alpha beta gamma delta epsilon zeta eta theta",
+            provider="openai",
+            endpoint="responses",
+            role="tool",
+            item_type="custom_tool_call_output",
+            retrieval_available=False,
+            min_bytes=1,
+            metadata={"incremental_lossless": "true"},
+        ),
+        router=Router(
+            "alpha beta gamma",
+            strategy=CompressionStrategy.SMART_CRUSHER,
+            lossless=True,
+        ),
+        tokenizer=TokenCounter(),
+    )
+
     assert result.modified is True
     assert result.reason is None
-    assert result.compressed == "summary for tool=0"
+    assert result.compressed == "alpha beta gamma"
 
 
 def test_compression_unit_still_compresses_assistant_text():
