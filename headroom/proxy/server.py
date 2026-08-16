@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import os
+import ssl
 import sys
 import threading
 import time
@@ -2135,13 +2136,25 @@ class HeadroomProxy(
 
                     return response
 
-            # httpx.TransportError covers ConnectError, the timeout family, and —
-            # crucially — the protocol errors (Local/RemoteProtocolError, e.g. an
-            # HTTP/2 `StreamReset`) that a poisoned shared h2 connection raises on
-            # every in-flight request. Retrying drops the bad connection and
-            # re-sends on a fresh one instead of collapsing to a 502. (#1639)
-            except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            # httpx.TransportError covers ConnectError, timeouts, and protocol
+            # errors such as an HTTP/2 `StreamReset`. ssl.SSLError is separate.
+            # Retrying either error uses a fresh pooled connection. (#1639)
+            except (httpx.TransportError, httpx.HTTPStatusError, ssl.SSLError) as e:
                 last_error = e
+
+                if isinstance(e, ssl.SSLError):
+                    logger.error(
+                        "[%s] Upstream SSL error url=%s http2_enabled=%s attempt=%s/%s: %r",
+                        request_id or "-",
+                        url,
+                        bool(
+                            getattr(self.config, "http2", False)
+                            and not getattr(self.config, "http_proxy", None)
+                        ),
+                        attempt + 1,
+                        self.config.retry_max_attempts,
+                        e,
+                    )
 
                 if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
                     # On exhaustion, preserve the upstream 5xx status (e.g. 503

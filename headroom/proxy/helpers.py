@@ -15,6 +15,7 @@ import logging
 import os
 import random
 import re
+import ssl
 import threading
 import time
 from collections import OrderedDict
@@ -852,6 +853,7 @@ async def request_with_transient_retry(
     client: httpx.AsyncClient,
     *,
     request_id: str | None = None,
+    http2_enabled: bool | None = None,
     max_retries: int = 1,
     **request_kwargs: Any,
 ) -> httpx.Response:
@@ -866,8 +868,8 @@ async def request_with_transient_retry(
     is healthy (it answers a fresh connection with 200). Retrying opens a new
     connection and succeeds, mirroring curl's behaviour. See GH #1112.
 
-    Only ``httpx.RemoteProtocolError`` is retried — the specific stale
-    keep-alive symptom; every other exception (``ConnectError``, timeouts,
+    ``httpx.RemoteProtocolError`` and ``ssl.SSLError`` are retried. Every other
+    exception (``ConnectError``, timeouts,
     HTTP status errors) propagates immediately so existing handling is
     unchanged. Use this for buffered (non-streaming) requests only: a streamed
     response cannot be safely replayed once bytes have reached the client.
@@ -878,7 +880,17 @@ async def request_with_transient_retry(
     while True:
         try:
             return await client.request(**request_kwargs)
-        except httpx.RemoteProtocolError as exc:
+        except (httpx.RemoteProtocolError, ssl.SSLError) as exc:
+            if isinstance(exc, ssl.SSLError):
+                logger.error(
+                    "[%s] Upstream SSL error url=%s http2_enabled=%s attempt=%s/%s: %r",
+                    request_id or "-",
+                    request_kwargs.get("url", "<unknown>"),
+                    http2_enabled,
+                    attempt + 1,
+                    max_retries + 1,
+                    exc,
+                )
             if attempt >= max_retries:
                 raise
             attempt += 1

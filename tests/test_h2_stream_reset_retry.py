@@ -10,6 +10,7 @@ collapsing to a 502. These tests drive the real `_retry_request` and
 
 from __future__ import annotations
 
+import ssl
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -142,3 +143,70 @@ async def test_stream_reset_exhaustion_yields_sse_error_not_crash():
     assert proxy.http_client.send.await_count == 2
     assert b"event: error" in body
     assert b"connection_error" in body
+
+
+@pytest.mark.asyncio
+async def test_retry_request_retries_ssl_error_then_succeeds():
+    proxy = _mock_proxy()
+    good = MagicMock()
+    good.status_code = 200
+    good.request = MagicMock()
+    proxy.http_client.post = AsyncMock(
+        side_effect=[
+            ssl.SSLError("[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac"),
+            good,
+        ]
+    )
+
+    result = await proxy._retry_request(
+        "POST",
+        "https://api.anthropic.com/v1/messages",
+        {"x-api-key": "sk-test"},
+        {"model": "claude-sonnet-4-20250514", "messages": []},
+        request_id="test-ssl-retry",
+    )
+
+    assert result is good
+    assert proxy.http_client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ssl_exhaustion_yields_clean_connection_error():
+    proxy = _mock_proxy()
+    proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+    proxy.http_client.send = AsyncMock(
+        side_effect=ssl.SSLError("[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac (_ssl.c:2570)")
+    )
+
+    result = await _run_stream(proxy)
+    body = b"".join([chunk async for chunk in result.body_iterator])
+
+    assert proxy.http_client.send.await_count == 2
+    assert b"event: error" in body
+    assert b"connection_error" in body
+    assert b"upstream TLS connection failed; please retry" in body
+    assert b"SSLV3_ALERT_BAD_RECORD_MAC" not in body
+    assert b"_ssl.c" not in body
+
+
+@pytest.mark.asyncio
+async def test_mid_stream_ssl_error_yields_clean_api_error():
+    proxy = _mock_proxy()
+    response = _good_stream_response([])
+
+    async def _broken_stream():
+        yield b'event: message_start\ndata: {"type":"message_start"}\n\n'
+        raise ssl.SSLError("[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac (_ssl.c:2570)")
+
+    response.aiter_bytes = _broken_stream
+    proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+    proxy.http_client.send = AsyncMock(return_value=response)
+
+    result = await _run_stream(proxy)
+    body = b"".join([chunk async for chunk in result.body_iterator])
+
+    assert b"message_start" in body
+    assert b"api_error" in body
+    assert b"upstream TLS connection failed; please retry" in body
+    assert b"SSLV3_ALERT_BAD_RECORD_MAC" not in body
+    assert b"_ssl.c" not in body

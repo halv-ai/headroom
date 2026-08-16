@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import ssl
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -1247,8 +1248,21 @@ class StreamingMixin:
                 # `StreamReset`) from a poisoned shared h2 connection. This runs
                 # before any body byte is forwarded to the client, so re-sending
                 # on a fresh connection is safe and avoids a 502. (#1639)
-                except httpx.TransportError as e:
+                except (httpx.TransportError, ssl.SSLError) as e:
                     last_connect_error = e
+                    if isinstance(e, ssl.SSLError):
+                        logger.error(
+                            "[%s] Upstream SSL error url=%s http2_enabled=%s attempt=%s/%s: %r",
+                            request_id,
+                            url,
+                            bool(
+                                getattr(self.config, "http2", False)
+                                and not getattr(self.config, "http_proxy", None)
+                            ),
+                            attempt + 1,
+                            retry_attempts,
+                            e,
+                        )
                     if attempt >= retry_attempts - 1:
                         raise
 
@@ -1268,10 +1282,26 @@ class StreamingMixin:
                 raise last_connect_error or RuntimeError("upstream connection did not start")
         # Retries exhausted (or a transport failure escaped the loop): emit a
         # clean SSE error instead of letting an h2 StreamReset bubble up as a
-        # 502. Covers ConnectError/timeouts and Local/RemoteProtocolError. (#1639)
-        except httpx.TransportError as e:
-            error_msg = str(e) or repr(e)
-            logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
+        # 502. Covers transport errors and ssl.SSLError. (#1639)
+        except (httpx.TransportError, ssl.SSLError) as e:
+            raw_error = str(e) or repr(e)
+            if isinstance(e, ssl.SSLError):
+                logger.error(
+                    "[%s] Upstream SSL retry exhausted url=%s http2_enabled=%s attempt=%s/%s: %r",
+                    request_id,
+                    url,
+                    bool(
+                        getattr(self.config, "http2", False)
+                        and not getattr(self.config, "http_proxy", None)
+                    ),
+                    attempt + 1,
+                    retry_attempts,
+                    e,
+                )
+                error_msg = "upstream TLS connection failed; please retry"
+            else:
+                logger.error(f"[{request_id}] Connection error to upstream API: {raw_error}")
+                error_msg = raw_error
 
             async def _error_gen():
                 error_event = {
@@ -1606,10 +1636,27 @@ class StreamingMixin:
                 # Forward the upstream error response
                 yield e.response.content
             except Exception as e:
-                logger.error(f"[{request_id}] Unexpected streaming error: {e}")
+                if isinstance(e, ssl.SSLError):
+                    logger.error(
+                        "[%s] Mid-stream upstream SSL error url=%s http2_enabled=%s "
+                        "attempt=%s/%s: %r",
+                        request_id,
+                        url,
+                        bool(
+                            getattr(self.config, "http2", False)
+                            and not getattr(self.config, "http_proxy", None)
+                        ),
+                        attempt + 1,
+                        retry_attempts,
+                        e,
+                    )
+                    error_message = "upstream TLS connection failed; please retry"
+                else:
+                    logger.error(f"[{request_id}] Unexpected streaming error: {e}")
+                    error_message = str(e)
                 error_event = {
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": error_message},
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:

@@ -9757,6 +9757,11 @@ class OpenAIHandlerMixin:
             # succeeds, mirroring what a direct curl call does. See GH #1112.
             response = await request_with_transient_retry(
                 passthrough_client,  # type: ignore[arg-type]
+                http2_enabled=bool(
+                    passthrough_client is self.http_client
+                    and getattr(_pt_config, "http2", False)
+                    and not getattr(_pt_config, "http_proxy", None)
+                ),
                 method=request.method,
                 url=url,
                 headers=headers,

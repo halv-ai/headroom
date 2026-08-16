@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -118,6 +119,31 @@ def test_helper_respects_max_retries() -> None:
 
     assert result is ok
     assert client.request.await_count == 3
+
+
+def test_helper_recovers_after_one_ssl_error() -> None:
+    ok = _ok_response()
+    client = SimpleNamespace(
+        request=AsyncMock(
+            side_effect=[
+                ssl.SSLError("[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac"),
+                ok,
+            ]
+        )
+    )
+
+    result = asyncio.run(
+        request_with_transient_retry(
+            client,
+            request_id="test-ssl-helper",
+            http2_enabled=True,
+            method="GET",
+            url="https://up/v1/models",
+        )
+    )
+
+    assert result is ok
+    assert client.request.await_count == 2
 
 
 # ---------------------------------------------------------------------------
