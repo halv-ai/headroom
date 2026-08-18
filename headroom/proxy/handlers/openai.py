@@ -89,6 +89,7 @@ _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES = 10_000
 _OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v3"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_ENV = "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"
 _OPENAI_RESPONSES_INCREMENTAL_LOSSLESS_ENV = "HEADROOM_INCREMENTAL_LOSSLESS"
+_OPENAI_RESPONSES_INCREMENTAL_CCR_ENV = "HEADROOM_INCREMENTAL_CCR"
 _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
 _OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
 _OPENAI_RESPONSES_TOOL_OUTPUT_EXCLUDE_ENV = "HEADROOM_COMPRESS_TOOL_OUTPUT_EXCLUDE"
@@ -114,6 +115,22 @@ def _openai_responses_incremental_lossless_enabled() -> bool:
     value = os.environ.get(_OPENAI_RESPONSES_INCREMENTAL_LOSSLESS_ENV)
     if value is None:
         return True
+    return value.lower() in ("true", "1", "yes", "on")
+
+
+def _openai_responses_incremental_ccr_enabled() -> bool:
+    """Full CCR (with retrieval markers) on incremental Responses sessions.
+
+    Off by default. An incremental client sends each history item once, so
+    lossy compression is only safe when the agent has the headroom MCP
+    retrieve tool to fetch originals back. Hosts that inject that tool
+    (for example Halv) opt in via this environment variable; first-pass
+    shrinking then reduces the billed input of every later turn.
+    """
+
+    value = os.environ.get(_OPENAI_RESPONSES_INCREMENTAL_CCR_ENV)
+    if value is None:
+        return False
     return value.lower() in ("true", "1", "yes", "on")
 
 
@@ -2934,8 +2951,10 @@ class OpenAIHandlerMixin:
         """
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
-        effective_incremental_lossless = _openai_responses_incremental_lossless_enabled() and (
-            incremental_lossless or "previous_response_id" in payload
+        effective_incremental_lossless = (
+            _openai_responses_incremental_lossless_enabled()
+            and not _openai_responses_incremental_ccr_enabled()
+            and (incremental_lossless or "previous_response_id" in payload)
         )
 
         def _add_timing(name: str, started_at: float) -> None:

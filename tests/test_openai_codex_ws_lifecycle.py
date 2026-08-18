@@ -2171,3 +2171,14 @@ async def test_ws_recognized_client_with_real_path_is_not_restamped():
     # the caller already self-identifies via its User-Agent.
     assert "x-client" not in {k.lower() for k in client_ws.headers}
     assert handler.ws_sessions.active_count() == 0
+
+
+def test_incremental_ccr_env_opts_out_of_the_lossless_swap(monkeypatch):
+    from headroom.proxy.handlers import openai as handler_module
+
+    monkeypatch.delenv("HEADROOM_INCREMENTAL_CCR", raising=False)
+    assert not handler_module._openai_responses_incremental_ccr_enabled()
+    monkeypatch.setenv("HEADROOM_INCREMENTAL_CCR", "1")
+    assert handler_module._openai_responses_incremental_ccr_enabled()
+    monkeypatch.setenv("HEADROOM_INCREMENTAL_CCR", "off")
+    assert not handler_module._openai_responses_incremental_ccr_enabled()
