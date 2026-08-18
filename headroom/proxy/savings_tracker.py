@@ -458,6 +458,7 @@ def _empty_project_entry() -> dict[str, Any]:
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "cache_read_tokens": 0,
         "last_activity_at": None,
     }
 
@@ -480,6 +481,7 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         normalized["total_input_cost_usd"] = round(
             _coerce_float(entry.get("total_input_cost_usd")), 6
         )
+        normalized["cache_read_tokens"] = _coerce_int(entry.get("cache_read_tokens"))
         last_activity = _parse_timestamp(entry.get("last_activity_at"))
         normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
         projects[cleaned_name] = normalized
@@ -825,6 +827,7 @@ class SavingsTracker:
                 savings_usd_delta=delta_savings_usd,
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
+                cache_read_tokens_delta=cache_read_tokens,
             )
 
             # In --mode cache, headroom's own compression (tokens_saved) is
@@ -932,6 +935,7 @@ class SavingsTracker:
         savings_usd_delta: float = 0.0,
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
+        cache_read_tokens_delta: int = 0,
     ) -> None:
         """Accumulate per-project savings. Caller must hold ``self._lock``.
 
@@ -952,6 +956,11 @@ class SavingsTracker:
         entry["total_input_tokens"] += max(input_tokens_delta, 0)
         entry["total_input_cost_usd"] = round(
             entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
+        )
+        # Provider cache reads per project: the host UI shows them as
+        # "context reuse" next to compression savings.
+        entry["cache_read_tokens"] = (
+            entry.get("cache_read_tokens", 0) + max(cache_read_tokens_delta, 0)
         )
         entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
         if len(projects) > DEFAULT_MAX_PROJECTS:
