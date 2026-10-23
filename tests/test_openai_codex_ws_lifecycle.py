@@ -797,7 +797,7 @@ async def test_ws_response_create_error_rolls_back_to_original_frame(caplog, mon
         await handler.handle_openai_responses_ws(client_ws)
 
     assert upstream.sent[0] == original_frame
-    assert "reason=error_rollback" in caplog.text
+    assert "reason=compression_exception" in caplog.text
     assert len(handler.metrics.codex_ws_frames) == 1
     assert handler.metrics.codex_ws_frames[0]["failed"] is True
 
@@ -1266,8 +1266,8 @@ async def test_ws_first_frame_compression_uses_bounded_executor(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ws_first_frame_timeout_uses_error_rollback_reason(caplog, monkeypatch):
-    """A Codex WS timeout must stay bounded and roll back safely."""
+async def test_ws_first_frame_timeout_uses_timeout_reason(caplog, monkeypatch):
+    """Codex WS compression timeout must stay bounded and visible."""
     upstream_events = [
         json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
         json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
@@ -1298,15 +1298,15 @@ async def test_ws_first_frame_timeout_uses_error_rollback_reason(caplog, monkeyp
         await handler.handle_openai_responses_ws(client_ws)
 
     assert handler.compression_executor_timeouts == [0.01]
-    assert "reason=error_rollback" in caplog.text
+    assert "reason=compression_timeout" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_ws_first_frame_non_timeout_exception_uses_error_rollback_reason(
+async def test_ws_first_frame_non_timeout_exception_keeps_generic_reason(
     caplog,
     monkeypatch,
 ):
-    """A non-timeout compression failure must log an error rollback."""
+    """Codex WS non-timeout compression failures still log the generic reason."""
     upstream_events = [
         json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
         json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
@@ -1337,7 +1337,7 @@ async def test_ws_first_frame_non_timeout_exception_uses_error_rollback_reason(
         await handler.handle_openai_responses_ws(client_ws)
 
     assert handler.compression_executor_timeouts == [0.01]
-    assert "reason=error_rollback" in caplog.text
+    assert "reason=compression_exception" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1523,7 +1523,7 @@ async def test_ws_later_frame_timeout_records_failed_frame(caplog, monkeypatch):
     assert handler.compression_executor_timeouts == [0.01, 0.01]
     assert upstream.sent[-1] == second_frame
     assert failed_frames and failed_frames[-1]["elapsed_ms"] > 0
-    assert "reason=error_rollback" in caplog.text
+    assert "reason=compression_timeout" in caplog.text
 
 
 @pytest.mark.asyncio

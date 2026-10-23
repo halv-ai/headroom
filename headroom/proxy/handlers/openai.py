@@ -8877,7 +8877,7 @@ class OpenAIHandlerMixin:
                         f"(bytes={_ws_frame_bytes}): {type(_ce).__name__}: {_ce}"
                     )
                     _log_ws_passthrough(
-                        "error_rollback",
+                        "compression_timeout" if _timeout_failure else "compression_exception",
                         frame_index=1,
                         raw_bytes=_ws_frame_bytes,
                         frame_type="response.create" if body else "unknown",
@@ -9001,7 +9001,9 @@ class OpenAIHandlerMixin:
                         """Compress one client request frame with a Responses input.
 
                         Other event types pass through unchanged. Errors return
-                        the original frame and use the error_rollback reason.
+                        the original frame (with any forced store=false) and log
+                        compression_timeout, compression_exception or, for a
+                        failed rewrite, error_rollback.
                         Updates outer-scope ``tokens_saved``,
                         ``transforms_applied``, and
                         ``ws_frames_compressed`` so the session-end
@@ -9158,7 +9160,7 @@ class OpenAIHandlerMixin:
                                     _frame_err,
                                 )
                                 _log_ws_passthrough(
-                                    "error_rollback",
+                                    "compression_timeout",
                                     frame_index=frame_index,
                                     raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
                                     frame_type=str(parsed_frame.get("type") or "unknown"),
@@ -9167,7 +9169,9 @@ class OpenAIHandlerMixin:
                                 return (
                                     raw_after_store,
                                     store_forced,
-                                    "chatgpt_store_false" if store_forced else "error_rollback",
+                                    "chatgpt_store_false"
+                                    if store_forced
+                                    else "compression_timeout",
                                 )
                             finally:
                                 frame_compression_elapsed_ms = (
@@ -9203,8 +9207,8 @@ class OpenAIHandlerMixin:
                             )
                             # Roll back the compression, but keep the forced
                             # store=false that ChatGPT auth requires. A timeout
-                            # above reports error_rollback; any other failure
-                            # reports compression_exception (upstream naming).
+                            # above reports compression_timeout; any other
+                            # failure reports compression_exception.
                             return (
                                 raw_after_store,
                                 store_forced,
@@ -9413,6 +9417,7 @@ class OpenAIHandlerMixin:
                                 )
                                 if not _ws_bypass and _frame_reason not in {
                                     "error_rollback",
+                                    "compression_timeout",
                                     "compression_exception",
                                 }:
                                     (
