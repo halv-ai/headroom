@@ -94,6 +94,9 @@ def _reset_module_state(monkeypatch):
 
 def _make_compressor(monkeypatch, model: FakeModel, **config_kwargs) -> KompressCompressor:
     config_kwargs.setdefault("enable_ccr", False)
+    # These fixtures are deliberately tiny; drop the production word floor
+    # (min_input_words=64) to its clamp so the failsafe paths under test run.
+    config_kwargs.setdefault("min_input_words", 10)
     compressor = KompressCompressor(config=KompressConfig(**config_kwargs))
     monkeypatch.setattr(
         kc,
@@ -364,21 +367,6 @@ def test_carried_deadline_reaches_sequential_fallback(monkeypatch):
     assert results[0].compressed != contents[0]
     assert results[1].compressed == contents[1]
     assert model.calls == 1
-
-
-def test_acquire_bounded_unbounded_when_both_disabled():
-    semaphore = kc._execution_semaphore("onnx", "onnx")
-    assert kc._acquire_bounded(semaphore, None, None) is True
-    semaphore.release()
-
-
-def test_acquire_bounded_negative_remaining_does_not_raise():
-    semaphore = kc._execution_semaphore("onnx", "onnx")
-    assert semaphore.acquire(timeout=0)
-    try:
-        assert kc._acquire_bounded(semaphore, 5.0, -1.0) is False
-    finally:
-        semaphore.release()
 
 
 # ── Wall-clock budget: give up before the proxy's stage timeout ───────

@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 _ISOLATED_MODULE_NAMES = (
     "headroom.proxy",
     "headroom.proxy.handlers",
-    "httpx",
     "fastapi.responses",
     "tests.headroom_proxy_handlers_openai",
     "tests.headroom_proxy_handlers_streaming",
@@ -42,21 +41,30 @@ def _load_handler_module(monkeypatch: pytest.MonkeyPatch, module_name: str, rela
     handlers_pkg.__path__ = [str(ROOT / "headroom" / "proxy" / "handlers")]
     monkeypatch.setitem(sys.modules, "headroom.proxy.handlers", handlers_pkg)
 
-    httpx_mod = types.ModuleType("httpx")
-    httpx_mod.ConnectError = type("ConnectError", (Exception,), {})
-    httpx_mod.ConnectTimeout = type("ConnectTimeout", (Exception,), {})
-    httpx_mod.PoolTimeout = type("PoolTimeout", (Exception,), {})
-    httpx_mod.ReadTimeout = type("ReadTimeout", (Exception,), {})
-    monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
+    # The real httpx, not a stub: it is a core dependency, and a partial stub
+    # breaks whatever else imports httpx during a cold import (the CCR/MCP SSE
+    # client needs httpx.Response). It also keeps the exception hierarchy the
+    # proxy catches (TransportError and its subclasses) exactly as in production.
 
     responses_mod = types.ModuleType("fastapi.responses")
 
     class Response:
-        def __init__(self, content=None, status_code: int = 200, headers=None, media_type=None):
+        def __init__(
+            self,
+            content=None,
+            status_code: int = 200,
+            headers=None,
+            media_type=None,
+            background=None,
+        ):
             self.content = content
             self.status_code = status_code
             self.headers = headers or {}
             self.media_type = media_type
+            # The streaming forwarder attaches a background task that releases the
+            # upstream stream when the body is never consumed (#2882); the double
+            # must accept and store it so the real StreamingResponse call works.
+            self.background = background
 
     class StreamingResponse(Response):
         pass
@@ -228,6 +236,9 @@ def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
     assert sent_headers["Authorization"] == "Bearer upstream-token"
     assert sent_headers["content-type"] == "application/json"
     assert response.status_code == 200
+    # The Copilot auth hook and the #2882 upstream-stream cleanup coexist: the
+    # streaming response still carries its background release task.
+    assert response.background is not None
 
 
 def test_openai_chat_routes_copilot_requests_per_model(monkeypatch: pytest.MonkeyPatch) -> None:
