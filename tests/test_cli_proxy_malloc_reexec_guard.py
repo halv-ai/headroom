@@ -101,3 +101,21 @@ def test_reexec_still_execs_for_a_real_cli_launch(monkeypatch: pytest.MonkeyPatc
     assert argv[1:] == ["-m", "headroom.cli", "proxy", "--port", "8787"]
     for key, value in proxy_cli._MALLOC_TUNING.items():
         assert proxy_cli.os.environ[key] == value
+
+
+def test_reexec_does_not_exec_from_a_frozen_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PyInstaller runtime cannot run ``-m headroom.cli``; it must not exec."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "argv", ["headroom", "proxy", "--port", "8787"])
+    monkeypatch.delenv("_HEADROOM_MALLOC_TUNED", raising=False)
+    for key in proxy_cli._MALLOC_TUNING:
+        monkeypatch.delenv(key, raising=False)
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(proxy_cli.os, "execv", lambda *a, **k: calls.append(a))
+
+    proxy_cli._reexec_with_malloc_tuning()
+
+    assert calls == []
+    assert "_HEADROOM_MALLOC_TUNED" not in proxy_cli.os.environ

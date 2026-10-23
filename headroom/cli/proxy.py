@@ -164,6 +164,12 @@ def _reexec_with_malloc_tuning() -> None:
         return
     if os.environ.get("_HEADROOM_MALLOC_TUNED") == "1":
         return
+    # A frozen (PyInstaller) binary is not a Python interpreter, so
+    # ``sys.executable -m headroom.cli`` would start the embedder's own CLI
+    # with the wrong arguments and the proxy would exit at once. Halv fork:
+    # the embedder sets the malloc variables in the child environment.
+    if getattr(sys, "frozen", False):
+        return
     if not _process_is_headroom_cli_entrypoint():
         return
     missing = {k: v for k, v in _MALLOC_TUNING.items() if k not in os.environ}
