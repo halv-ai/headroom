@@ -766,6 +766,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 input_tokens_optimized=outcome.optimized_tokens,
                 output_tokens=outcome.output_tokens,
                 tokens_saved=outcome.tokens_saved,
+                novel_tokens_saved=novel_tokens_saved,
                 savings_percent=outcome.savings_pct,
                 optimization_latency_ms=outcome.overhead_ms,
                 total_latency_ms=outcome.total_latency_ms,

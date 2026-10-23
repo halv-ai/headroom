@@ -96,6 +96,13 @@ class RequestLog:
     cache_write_tokens: int = 0
     uncached_input_tokens: int = 0
 
+    # Savings that are new to this conversation (``conversation_savings``).
+    # ``tokens_saved`` stays the wire truth for THIS request; rollups that sum
+    # over requests (agent usage) must sum this figure instead, or a
+    # full-transcript Responses client counts each removed token once per
+    # turn. None on paths that do not distinguish (then tokens_saved is novel).
+    novel_tokens_saved: int | None = None
+
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
 

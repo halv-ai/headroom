@@ -274,3 +274,45 @@ def test_agent_usage_clamps_negative_token_values() -> None:
     assert row["tokens_saved"] == 0
     assert row["output_tokens"] == 0
     assert row["has_exact_tokens"] is False
+
+
+def test_agent_usage_counts_conversation_savings_once() -> None:
+    # A full-transcript Responses client re-sends the whole conversation, so
+    # each request's tokens_saved is the running total. The rollup must sum
+    # the conversation-novel figure, matching tokens.saved and per_project.
+    turns = [(6043, 6043), (12087, 6044)]
+    summary = _build_agent_usage_summary(
+        [
+            {
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "tags": {"client": "codex"},
+                "input_tokens_original": 12000 * index,
+                "input_tokens_optimized": 6000 * index,
+                "output_tokens": 1,
+                "tokens_saved": wire,
+                "novel_tokens_saved": novel,
+            }
+            for index, (wire, novel) in enumerate(turns, start=1)
+        ]
+        + [
+            {
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "tags": {"client": "codex"},
+                "input_tokens_original": 900,
+                "input_tokens_optimized": 800,
+                "output_tokens": 1,
+                "tokens_saved": 100,
+            }
+        ],
+        requests_by_provider={},
+        requests_by_model={},
+        global_before_tokens=0,
+        global_after_tokens=0,
+        global_tokens_saved=12187,
+        global_output_tokens=0,
+    )
+
+    codex = next(row for row in summary["agents"] if row["agent"] == "codex")
+    assert codex["tokens_saved"] == 6043 + 6044 + 100

@@ -366,7 +366,13 @@ def _build_agent_usage_summary(
         row = _agent_row(agent_key, label, source)
         before = max(0, int(entry.get("input_tokens_original") or 0))
         after = max(0, int(entry.get("input_tokens_optimized") or 0))
-        saved = max(0, int(entry.get("tokens_saved") or 0))
+        # Sum the conversation-novel figure: a full-transcript Responses
+        # client reports the running conversation total on every request.
+        novel_saved = entry.get("novel_tokens_saved")
+        saved = max(
+            0,
+            int(novel_saved if novel_saved is not None else (entry.get("tokens_saved") or 0)),
+        )
         output = max(0, int(entry.get("output_tokens") or 0))
         provider = str(entry.get("provider") or "unknown")
         model = str(entry.get("model") or "unknown")
