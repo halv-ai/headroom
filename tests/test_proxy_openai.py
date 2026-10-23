@@ -19,6 +19,19 @@ from headroom.proxy.helpers import (
 
 TOOL_SEARCH_MODEL = "gpt-5.5"
 
+# Halv fork options that ride the same compressor call. The client-decision
+# tests below compare the upstream keys only; the fork keys are asserted
+# separately where they matter.
+_FORK_COMPRESSION_KEYS = frozenset(
+    {
+        "compress_responses_messages",
+        "protect_recent",
+        "preserve_tools",
+        "incremental_lossless",
+        "codex_ws_function_name_by_call_id",
+    }
+)
+
 
 def _tool_payload() -> list[dict[str, object]]:
     """Six core coding tools plus ten non-core ones, over the injection minimum."""
@@ -133,7 +146,11 @@ def test_native_responses_compressor_scopes_the_exclusion_per_call() -> None:
     asyncio.run(_run())
 
     assert [
-        {key: value for key, value in call.items() if key not in {"timing", "deadline_started_at"}}
+        {
+            key: value
+            for key, value in call.items()
+            if key not in {"timing", "deadline_started_at", *_FORK_COMPRESSION_KEYS}
+        }
         for call in seen
     ] == [
         {"client": "opencode"},
@@ -390,7 +407,11 @@ def test_native_responses_route_carries_the_client_decision(
         assert transport.call_count == 1, response.text
         assert response.status_code == 200, response.text
         assert seen, "the Responses compressor was never reached"
-        assert {k: v for k, v in seen[0].items() if k not in {"timing", "savings_tags"}} == expected
+        assert {
+            k: v
+            for k, v in seen[0].items()
+            if k not in {"timing", "savings_tags", *_FORK_COMPRESSION_KEYS}
+        } == expected
 
 
 # --- production route: the Codex WebSocket handler ---------------------------
@@ -449,5 +470,12 @@ def test_websocket_route_carries_the_client_decision(
 
     assert seen, "the Responses compressor was never reached on the WS path"
     assert {
-        k: v for k, v in seen[0].items() if k not in {"timing", "deadline_started_at"}
+        k: v
+        for k, v in seen[0].items()
+        if k not in {"timing", "deadline_started_at", *_FORK_COMPRESSION_KEYS}
     } == expected
+    # Halv fork: Codex WS frames keep tool definitions and use the
+    # incremental lossless router; other clients do not.
+    is_codex = expected["client"] == "codex"
+    assert seen[0].get("preserve_tools", False) is is_codex
+    assert seen[0].get("incremental_lossless", False) is is_codex
