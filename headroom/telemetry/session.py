@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Session aggregation for the anonymous telemetry beacon.
 
 One wide event per session, emitted when the session goes idle. Everything here

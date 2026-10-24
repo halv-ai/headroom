@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Proxy server CLI commands."""
 
 import errno

@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Telemetry state for Headroom.
 
 Two independent switches, because they answer two different questions:

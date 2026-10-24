@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified by Halv. See FORK.md.
 """i18n compression-quality eval (zh/ja/ko): does extractive compression keep
 the answer-bearing content in CJK?  No LLM/API calls -- fully local.
 

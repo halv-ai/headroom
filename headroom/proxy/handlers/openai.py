@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """OpenAI handler mixin for HeadroomProxy.
 
 Contains all OpenAI Chat Completions, Responses API, and passthrough handlers.

@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Durable proxy savings and display-session tracking.
 
 Persists cumulative proxy compression savings plus a canonical display session

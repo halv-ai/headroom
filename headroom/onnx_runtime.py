@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """ONNX Runtime helpers for long-running Headroom processes."""
 
 from __future__ import annotations

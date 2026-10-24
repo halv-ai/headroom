@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Best-effort "is a newer Headroom released?" check.
 
 This module is intentionally dependency-light (stdlib + ``packaging`` only —

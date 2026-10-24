@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """``RequestOutcome``: the canonical value type for "what happened during
 one completed proxy request."
 

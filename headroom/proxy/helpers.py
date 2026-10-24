@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Top-level helper functions and constants for the Headroom proxy.
 
 Contains lazy loaders, file logging setup, request body decompression,

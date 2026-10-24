@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Bounded batching for small provider-extracted compression units."""
 
 from __future__ import annotations

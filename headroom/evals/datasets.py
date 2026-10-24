@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Dataset loaders for evaluation benchmarks.
 
 Loads real data from established sources for comprehensive compression evaluation:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified by Halv. See FORK.md.
 """Verify that CI can load the default embedding model offline.
 
 The main test shards run with TRANSFORMERS_OFFLINE=1. If the Hugging Face cache

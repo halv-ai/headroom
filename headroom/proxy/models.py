@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Data models for the Headroom proxy.
 
 Contains configuration and data classes used across the proxy modules.

@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """``headroom telemetry`` — show exactly what the beacon would send.
 
 This fork ships the beacon opt-in: it is off until HEADROOM_BEACON=on. (Upstream

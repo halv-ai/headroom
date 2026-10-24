@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """HuggingFace tokenizer wrapper for open models.
 
 Supports Llama, Mistral, Falcon, and other models with HuggingFace

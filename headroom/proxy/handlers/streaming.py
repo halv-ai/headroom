@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Streaming handler mixin for HeadroomProxy.
 
 Contains SSE parsing, streaming response generation, and related utilities.

@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Headroom MCP Server — Context engineering toolkit for AI coding tools.
 
 Exposes Headroom's compression, retrieval, and observability as MCP tools

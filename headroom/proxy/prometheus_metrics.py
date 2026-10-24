@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Prometheus-compatible metrics for the Headroom proxy.
 
 Tracks request counts, token usage, latency, overhead, TTFB,

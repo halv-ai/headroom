@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """Provider-neutral compression units.
 
 Provider adapters own request-envelope details and cache/live-zone decisions.

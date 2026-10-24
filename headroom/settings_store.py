@@ -1,3 +1,4 @@
+# Modified by Halv. See FORK.md.
 """File-backed store for a curated subset of Headroom's runtime knobs (mostly ``HEADROOM_*``,
 
 The dashboard settings GUI persists these knobs to ``settings.json`` in the

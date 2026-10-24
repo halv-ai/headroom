@@ -1,3 +1,7 @@
+> **This is Halv's fork of [Headroom](https://github.com/headroomlabs-ai/headroom).**
+> It is not affiliated with or endorsed by Headroom Labs. See [FORK.md](FORK.md) for
+> what this fork changes, including the upload beacon, which is off by default here.
+
 <div align="center">
 
 <img src=".github/assets/hero.svg" alt="Headroom — the context compression layer for AI agents. A 55,957 token agent prompt compresses to the 24,340 tokens actually sent to the model, and the FATAL line at item 67 survives byte for byte." width="880">
