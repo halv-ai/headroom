@@ -1,6 +1,7 @@
 """``headroom telemetry`` — show exactly what the beacon would send.
 
-The beacon is opt-OUT and on by default. "The receiver is open source, go read
+This fork ships the beacon opt-in: it is off until HEADROOM_BEACON=on. (Upstream
+Headroom ships it opt-out.) "The receiver is open source, go read
 worker.js" is a good answer to what happens to the data, but it is a poor
 answer to what LEAVES YOUR MACHINE — that requires reading two files, trusting
 that the copy on GitHub matches the copy installed, and reconstructing a
@@ -134,7 +135,7 @@ def telemetry(show: bool, as_json: bool) -> None:
         )
         return
 
-    click.echo(f"Upload beacon:   {'ON (opt-out)' if beacon_on else 'OFF'}")
+    click.echo(f"Upload beacon:   {'ON' if beacon_on else 'OFF (opt-in)'}")
     click.echo(f"Local stats:     {'ON' if local_on else 'OFF (opt-in)'}")
     click.echo(f"Endpoint:        {DEFAULT_ENDPOINT}")
     click.echo(

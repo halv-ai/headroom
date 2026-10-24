@@ -843,7 +843,7 @@ class HeadroomMCPServer:
             client=self._current_client(),
             source="mcp",
         )
-        # Anonymous beacon (opt-out; no-op unless enabled). Without this the MCP
+        # Anonymous beacon (opt-in in this fork; no-op unless enabled). Without this the MCP
         # path is invisible to aggregate stats even though it is a first-class
         # way to use Headroom — and subagents make that worse, since each runs
         # its own MCP server. Swallows its own errors; the caller's try/except

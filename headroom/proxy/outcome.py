@@ -524,8 +524,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
 
         outcome = dataclasses.replace(outcome, provider="copilot")
 
-    # 0. Anonymous session beacon. Opt-in and a no-op unless HEADROOM_TELEMETRY
-    #    is explicitly on, in which case it folds this outcome into an in-memory
+    # 0. Anonymous session beacon. Opt-in in this fork and a no-op unless
+    #    HEADROOM_BEACON is explicitly on, in which case it folds this outcome into an in-memory
     #    per-session aggregate and POSTs one content-free event when the session
     #    goes idle (off-thread — see telemetry.session.post_session_event).
     #

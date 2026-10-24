@@ -1749,8 +1749,8 @@ Memory (Multi-Provider):
     # Build telemetry section for the startup banner.
     #
     # HEADROOM_TELEMETRY (local aggregate stats, off by default) and
-    # HEADROOM_BEACON (the anonymous upload beacon, ON by default —
-    # see telemetry/beacon.py) are two independent switches. This banner
+    # HEADROOM_BEACON (the anonymous upload beacon, off by default in this
+    # fork — see telemetry/beacon.py) are two independent switches. This banner
     # used to check only is_telemetry_enabled() and print "DISABLED" for
     # any operator who had merely turned local stats off, even though the
     # beacon — the switch that actually ships data off the machine — was

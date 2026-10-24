@@ -377,8 +377,8 @@ _CONFIG_ENV_KEYS = (
 # keeps three things true at once:
 #
 #   * The executor thread never takes the aggregator's lock, so compression
-#     cannot serialise against the request path. The beacon is on by default,
-#     and ContentRouter observes once per routing decision — once per content
+#     cannot serialise against the request path. The beacon can be on (opt-in
+#     in this fork), and ContentRouter observes once per routing decision — once per content
 #     section per request — so that contention would be real.
 #   * A compression event cannot CREATE a session. Sessions are started only by
 #     an outcome, which preserves the invariant that every emitted session has

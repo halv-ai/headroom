@@ -2,8 +2,9 @@
 
 This module is intentionally dependency-light (stdlib + ``packaging`` only —
 ``httpx`` lives in the ``[proxy]`` extra and must not be required by the base
-CLI). It mirrors the telemetry beacon contract: opt-out, cached, fire-and-
-forget, and it must never raise into a caller or block startup.
+CLI). It follows the upstream telemetry beacon contract: opt-out, cached,
+fire-and-forget, and it must never raise into a caller or block startup. (This
+fork makes the beacon itself opt-in; the update check stays opt-out.)
 
 Two halves, deliberately split so a background thread never races stdout:
 

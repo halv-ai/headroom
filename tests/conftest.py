@@ -96,12 +96,13 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HEADROOM_HARD_WATCHDOG_SECS", "0")
 
 
-# The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
-# and the beacon defaults to ON. So scrubbing for hermeticity is precisely what
-# switches it on, and with HEADROOM_TELEMETRY_ENDPOINT scrubbed too it falls back
-# to the real production endpoint. Every test that reaches the outcome funnel
-# then POSTs a session event for real: observed writing into the live corpus
-# during a local run, and CI would do the same on every push.
+# The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON.
+# Upstream's beacon defaults to ON, so there scrubbing for hermeticity is
+# precisely what switches it on, and with HEADROOM_TELEMETRY_ENDPOINT scrubbed
+# too it falls back to the real production endpoint. Every test that reaches
+# the outcome funnel then POSTs a session event for real: observed writing into
+# the live corpus during a local run. This fork defaults the beacon to OFF, but
+# the explicit off value stays as a second guard.
 #
 # Depends on the scrub fixture so it is guaranteed to run after it rather than
 # relying on declaration order. A test that wants the beacon on just sets the

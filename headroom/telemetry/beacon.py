@@ -6,11 +6,12 @@ Two independent switches, because they answer two different questions:
 for the in-process collector and the ``/stats`` / ``/v1/telemetry`` endpoints.
 Never leaves the machine.
 
-``HEADROOM_BEACON`` — **on by default, opt-out.** Uploads an anonymous,
-content-free session summary to Headroom Labs. Disable with
-``HEADROOM_BEACON=off``, ``DO_NOT_TRACK=1``, or offline mode. See
-:mod:`headroom.telemetry.session` for the exact payload and
-``deploy/beacon/worker.js`` for what the receiver does with it.
+``HEADROOM_BEACON`` — **off by default in this fork, opt-in.** Uploads an
+anonymous, content-free session summary to Headroom Labs only after an
+explicit ``HEADROOM_BEACON=on``. ``DO_NOT_TRACK=1`` and offline mode keep it
+off even then. Upstream Headroom turns it on by default; this fork does not
+(see FORK.md). See :mod:`headroom.telemetry.session` for the exact payload
+and ``deploy/beacon/worker.js`` for what the receiver does with it.
 
 Operational metrics are separate again, and go to *your own* OpenTelemetry
 collector via ``HEADROOM_OTEL_METRICS_*`` — a destination you control, that
@@ -48,12 +49,15 @@ def is_telemetry_enabled() -> bool:
 # Whether the upload beacon runs when the operator has expressed no preference.
 #
 # True makes Headroom opt-OUT: every install uploads anonymous session summaries
-# unless it is told not to. Flip to False for opt-in and nothing uploads without
-# an explicit HEADROOM_BEACON=on.
+# unless it is told not to. False makes it opt-in: nothing uploads without an
+# explicit HEADROOM_BEACON=on.
 #
 # This single constant is the whole policy — deliberately, so the decision is
 # one line to audit and one line to reverse.
-BEACON_DEFAULT_ON = True
+#
+# Modified by Halv: upstream ships True. This fork ships False, so the beacon
+# is opt-in. See FORK.md.
+BEACON_DEFAULT_ON = False
 
 
 def is_beacon_enabled() -> bool:
@@ -73,9 +77,11 @@ def is_beacon_enabled() -> bool:
     would mean every operator who had turned on local stats begins transmitting
     the moment they upgrade, having answered a different question.
 
-    Note the asymmetry with :func:`is_telemetry_enabled`, which is fail-closed:
-    this one is fail-open by construction while ``BEACON_DEFAULT_ON`` is True,
-    so an unrecognised value uploads rather than staying silent.
+    Note the relation to :func:`is_telemetry_enabled`, which is fail-closed:
+    an unrecognised value here falls back to ``BEACON_DEFAULT_ON``. This fork
+    sets that constant to False, so an unset, empty, or unrecognised value
+    stays silent. Only an explicit on-value (on/true/1/yes/enable/enabled)
+    uploads.
     """
     from headroom.offline import is_offline
 
@@ -120,8 +126,9 @@ def format_telemetry_notice(*, prefix: str = "") -> str:
     if not beacon and not local:
         return ""
 
-    # The beacon line comes first and is unconditional when on. It is opt-out,
-    # so this notice is the only place a user learns it is running at all —
+    # The beacon line comes first and is unconditional when on. Upstream ships
+    # the beacon opt-out, and this fork ships it opt-in (HEADROOM_BEACON=on).
+    # Either way this notice is the place a user sees that it is running —
     # surprise is what turns anonymous telemetry into a trust incident.
     #
     # Wording: lead with what the data *is* (counters) and why it is useful
@@ -134,8 +141,8 @@ def format_telemetry_notice(*, prefix: str = "") -> str:
     #
     # "compression stats" until schema v2, which widened the payload to cache
     # behaviour, session shape, harness and configuration. All still counters,
-    # all still content-free — but this notice is the only place an opt-out
-    # beacon is disclosed at all, so it has to describe what is actually sent
+    # all still content-free — but this notice is the main place the running
+    # beacon is disclosed, so it has to describe what is actually sent
     # rather than the narrowest true thing. `headroom telemetry --show` prints
     # the exact payload for anyone who wants the specifics.
     if beacon:

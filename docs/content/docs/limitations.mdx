@@ -167,17 +167,17 @@ this page's "nothing leaves the machine" framing as universal:
 - **`HEADROOM_TELEMETRY`** -- off by default, opt-in. Aggregates compression
   stats locally for the in-process collector and the `/stats` endpoint.
   Never leaves the machine.
-- **`HEADROOM_BEACON`** -- **on by default, opt-out.** Uploads an anonymous
+- **`HEADROOM_BEACON`** -- **off by default in this fork, opt-in** (upstream
+  Headroom ships it on by default). With `HEADROOM_BEACON=on`, uploads an anonymous
   summary of how compression behaved, so we can see when a release regresses a
   ratio or starts skipping a content type across real workloads instead of only
   our own test corpus. It carries counters and identifiers only: token totals,
   compression ratios, skip reasons, provider and model ids, failure counts, plus
   OS and architecture. Never prompts, completions, code, or file paths -- the
-  collector allowlists fields server-side and drops the rest. Disable it with
-  `HEADROOM_BEACON=off`, the cross-tool `DO_NOT_TRACK=1` convention, or by
-  running offline. `is_beacon_enabled()` is fail-open: an unrecognized value
-  uploads rather than staying silent. See [Proxy](/docs/proxy) for the full
-  field list.
+  collector allowlists fields server-side and drops the rest. The cross-tool
+  `DO_NOT_TRACK=1` convention and offline mode keep it off even then. An unset,
+  empty, or unrecognized value stays silent. See [Proxy](/docs/proxy) for the
+  full field list.
 
 These are deliberately separate so that enabling local `/stats` does not
 silently start an upload on the next release.

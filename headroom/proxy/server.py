@@ -2325,8 +2325,8 @@ class HeadroomProxy(
         # Log local telemetry status so operators can see it in the log stream.
         # This is HEADROOM_TELEMETRY only (local aggregate stats; nothing
         # sent externally). It is NOT a statement about the anonymous upload
-        # beacon (HEADROOM_BEACON), which is a separate, ON-by-default switch
-        # (telemetry/beacon.py) still present in this codebase — the previous
+        # beacon (HEADROOM_BEACON), which is a separate switch (off by default
+        # in this fork, see telemetry/beacon.py) still present in this codebase — the previous
         # wording here ("the anonymous telemetry beacon was removed") was
         # false and predates this fix. See is_beacon_enabled() below for the
         # accurate beacon-shipping status.
@@ -2342,8 +2342,9 @@ class HeadroomProxy(
             )
         if is_beacon_enabled():
             logger.info(
-                "Anonymous upload beacon: ENABLED (default — session summaries are sent to "
-                "Headroom Labs). Opt out: HEADROOM_BEACON=off or DO_NOT_TRACK=1"
+                "Anonymous upload beacon: ENABLED (opted in with HEADROOM_BEACON — session "
+                "summaries are sent to Headroom Labs). Opt out: unset HEADROOM_BEACON, or set "
+                "HEADROOM_BEACON=off or DO_NOT_TRACK=1"
             )
         else:
             logger.info("Anonymous upload beacon: DISABLED")
@@ -5347,7 +5348,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # non-empty is the explanation for a savings drop in one language.
             "code_syntax_breaker": _code_syntax_breaker_status(),
             # Reflects the actual live state of the anonymous upload beacon
-            # (HEADROOM_BEACON, on by default — see telemetry/beacon.py).
+            # (HEADROOM_BEACON, off by default in this fork — see telemetry/beacon.py).
             # This field previously hardcoded False on the incorrect premise
             # that the beacon had been removed from the codebase; it had not,
             # so an operator polling /stats to confirm nothing ships

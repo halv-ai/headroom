@@ -89,12 +89,13 @@ host, and what the local admin surface does and does not allow. The summary:
   (`~/.headroom/ccr_store.db`, `0600`) so they can be retrieved after compression. Entries
   are plaintext and are not encrypted at rest. Set `HEADROOM_CCR_BACKEND=memory` if your
   deployment cannot accept disk persistence.
-- **Anonymous session summaries are uploaded by default.** The `HEADROOM_BEACON` telemetry
-  beacon is opt-*out*: it POSTs content-free session counters, a random per-install UUID,
-  version, OS, and architecture to Headroom Labs. No prompts, completions, file contents,
-  or paths are included. Disable with `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or
-  `HEADROOM_OFFLINE=1`. This is separate from `HEADROOM_TELEMETRY`, which is opt-in and
-  stays on the machine.
+- **Anonymous session summaries are uploaded only after you opt in.** In this fork the
+  `HEADROOM_BEACON` telemetry beacon is opt-*in* (upstream Headroom ships it opt-out; see
+  `FORK.md`). With `HEADROOM_BEACON=on`, it POSTs content-free session counters, a random
+  per-install UUID, version, OS, and architecture to Headroom Labs. No prompts,
+  completions, file contents, or paths are included. `DO_NOT_TRACK=1` and
+  `HEADROOM_OFFLINE=1` keep it off even when `HEADROOM_BEACON=on`. This is separate from
+  `HEADROOM_TELEMETRY`, which is opt-in and stays on the machine.
 - **Passthrough mode**: Sensitive content passes through unchanged by default.
 - **Operational logs are written unconditionally.** `~/.headroom/logs/proxy.log`
   (10 MB × 5 rotations) is always on and also carries the admin audit stream. The

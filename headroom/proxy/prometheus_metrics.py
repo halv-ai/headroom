@@ -627,8 +627,8 @@ class PrometheusMetrics:
         # that have no observer at all pass telemetry's
         # BeaconCompressionObserver directly instead.)
         #
-        # The beacon is ON by default, so this does not short-circuit in
-        # practice and must stay off the aggregator's lock: it stages into a
+        # The beacon can be on (HEADROOM_BEACON=on), so this cannot rely on a
+        # short-circuit and must stay off the aggregator's lock: it stages into a
         # dedicated mutex that the request path never takes, which is what
         # keeps this method's "synchronous + lock-free" contract honest with
         # respect to everything else in the process.
