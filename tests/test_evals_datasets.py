@@ -17,7 +17,15 @@ def install_fake_datasets(
 ) -> list[tuple[str, str | None, str | None]]:
     calls: list[tuple[str, str | None, str | None]] = []
 
-    def fake_load_dataset(name: str, subset: str | None = None, split: str | None = None):
+    # Modified by Halv: loaders pass the pinned revision= (see FORK.md).
+    def fake_load_dataset(
+        name: str,
+        subset: str | None = None,
+        split: str | None = None,
+        revision: str | None = None,
+    ):
+        if datasets._pinned_dataset_revision(name) is not None:
+            assert revision == datasets._PINNED_DATASET_REVISIONS[name]
         key = (name, subset, split)
         calls.append(key)
         return mapping[key]
@@ -199,7 +207,13 @@ def test_load_longbench_narrativeqa_toolbench_codesearchnet_and_humaneval(
 
     longbench = datasets.load_longbench(n=2, task="qasper")
     narrative = datasets.load_narrativeqa(n=1)
+    # ToolBench/ToolBench was not on the Hub on 2026-10-24, so it has no pin
+    # and the loader refuses it unless pinning is off.
+    with pytest.raises(ValueError, match="no pinned revision"):
+        datasets.load_toolbench(n=1, category="G1")
+    monkeypatch.setenv("HEADROOM_HF_PIN", "off")
     toolbench = datasets.load_toolbench(n=1, category="G1")
+    monkeypatch.delenv("HEADROOM_HF_PIN")
     codesearchnet = datasets.load_codesearchnet(n=1, language="python")
     humaneval = datasets.load_humaneval(n=2)
 
@@ -487,7 +501,9 @@ def test_dataset_loaders_cover_skip_and_limit_branches(monkeypatch: pytest.Monke
     assert len(datasets.load_squad(n=1).cases) == 1
     assert len(datasets.load_longbench(n=2, task="qasper").cases) == 1
     assert len(datasets.load_narrativeqa(n=1).cases) == 1
+    monkeypatch.setenv("HEADROOM_HF_PIN", "off")  # ToolBench has no pin
     assert len(datasets.load_toolbench(n=1, category="G1").cases) == 1
+    monkeypatch.delenv("HEADROOM_HF_PIN")
     assert len(datasets.load_codesearchnet(n=1, language="python").cases) == 1
     assert len(datasets.load_humaneval(n=1).cases) == 1
 

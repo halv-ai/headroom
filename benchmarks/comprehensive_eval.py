@@ -41,6 +41,8 @@ def load_bfcl_samples(n: int = 20) -> list[dict]:
             "gorilla-llm/Berkeley-Function-Calling-Leaderboard",
             "BFCL_v3_live_simple",
             split="train",
+            # Modified by Halv: pinned commit (see FORK.md).
+            revision="61fc0608cfd831fcfbbaa676ebdfef0ed963eeda",
             # BFCL is plain parquet; never execute a dataset repository's own
             # loading script, here or anywhere else in the tree.
             trust_remote_code=False,
@@ -76,7 +78,12 @@ def load_hotpotqa_samples(n: int = 20) -> list[dict]:
     try:
         from datasets import load_dataset
 
-        ds = load_dataset("hotpotqa/hotpot_qa", "fullwiki", split="validation")
+        ds = load_dataset(
+            "hotpotqa/hotpot_qa",
+            "fullwiki",
+            split="validation",
+            revision="1908d6afbbead072334abe2965f91bd2709910ab",  # Halv pin, see FORK.md
+        )
 
         samples = []
         for i, item in enumerate(ds):

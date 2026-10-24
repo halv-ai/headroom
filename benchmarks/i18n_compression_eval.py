@@ -245,7 +245,12 @@ def eval_multiwiki(
     print(f"  {'lang':6} {'text_crusher':>13} {'truncate':>9} {'random':>7}")
     for lang in langs:
         try:
-            ds = load_dataset("alexandrainst/multi-wiki-qa", lang, split=f"train[:{n * 2}]")
+            ds = load_dataset(
+                "alexandrainst/multi-wiki-qa",
+                lang,
+                split=f"train[:{n * 2}]",
+                revision="9bdb3350487e399bd1cd873e1395290d636db5ce",  # Halv pin, see FORK.md
+            )
         except Exception as e:  # noqa: BLE001 -- optional path, fail-open
             print(f"  {lang}: load failed ({e}); skipping")
             continue

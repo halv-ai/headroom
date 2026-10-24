@@ -38,6 +38,48 @@ from headroom.offline import guard_egress, is_offline
 logger = logging.getLogger(__name__)
 
 
+# Modified by Halv: pin every eval dataset to the main commit of its Hub repo
+# on 2026-10-24, so a changed dataset repo cannot change an eval silently. Keys
+# are the paths the loaders pass (legacy names redirect on the Hub; the SHA is
+# the commit of the repo they redirect to). A None value marks a dataset that
+# was not on the Hub at that date, and the loader refuses it while pinning is
+# on. HEADROOM_HF_PIN=off loads the default ref, as for models.
+_PINNED_DATASET_REVISIONS: dict[str, str | None] = {
+    "hotpotqa/hotpot_qa": "1908d6afbbead072334abe2965f91bd2709910ab",
+    "google-research-datasets/natural_questions": "e8103d566bef4154c2c12b17c6095ec5275840cc",
+    "trivia_qa": "0f7faf33a3908546c6fd5b73a660e0f8ff173c2f",
+    "microsoft/ms_marco": "a47ee7aae8d7d466ba15f9f0bfac3b3681087b3a",
+    "rajpurkar/squad_v2": "3ffb306f725f7d2ce8394bc1873b24868140c412",
+    "THUDM/LongBench": "5e628be450b7e67fb7ae6e201bd6d8f7056f7672",
+    "alexandrainst/multi-wiki-qa": "9bdb3350487e399bd1cd873e1395290d636db5ce",
+    "deepmind/narrativeqa": "2e643e7363944af1c33a652d1c87320d0871c4e4",
+    "ToolBench/ToolBench": None,
+    "code_search_net": "bd0cf261e357a3eb5c8fba490d23ec1a1cd59555",
+    "openai_humaneval": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+    "allenai/scrapinghub-article-extraction-benchmark": "f74b11e8b2e38f3828c3052622d108a22de53319",
+    "gorilla-llm/Berkeley-Function-Calling-Leaderboard": "61fc0608cfd831fcfbbaa676ebdfef0ed963eeda",
+}
+
+
+def _pinned_dataset_revision(path: str) -> str | None:
+    """Return the pinned commit for ``path``, or None when pinning is off.
+
+    Raises ``ValueError`` for a known dataset that has no pin, so it never
+    loads from a floating ref while pinning is on.
+    """
+    from headroom.onnx_runtime import hf_pinning_enabled
+
+    if not hf_pinning_enabled() or path not in _PINNED_DATASET_REVISIONS:
+        return None
+    revision = _PINNED_DATASET_REVISIONS[path]
+    if revision is None:
+        raise ValueError(
+            f"eval dataset {path} has no pinned revision (not on the Hub on 2026-10-24); "
+            "set HEADROOM_HF_PIN=off to load the default ref"
+        )
+    return revision
+
+
 def _check_datasets_installed() -> None:
     """Check if HuggingFace datasets is installed."""
     try:
@@ -61,6 +103,11 @@ def load_hf_dataset(path: str, *args: Any, **kwargs: Any) -> Any:
     before any remote attempt. Online, nothing changes.
     """
     from datasets import load_dataset
+
+    if kwargs.get("revision") is None:
+        revision = _pinned_dataset_revision(path)
+        if revision is not None:
+            kwargs["revision"] = revision
 
     if is_offline():
         import datasets.config as datasets_config
@@ -615,7 +662,9 @@ def load_bfcl(
     """
     import urllib.request
 
-    base_url = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main"
+    bfcl_repo = "gorilla-llm/Berkeley-Function-Calling-Leaderboard"
+    bfcl_ref = _pinned_dataset_revision(bfcl_repo) or "main"
+    base_url = f"https://huggingface.co/datasets/{bfcl_repo}/resolve/{bfcl_ref}"
     guard_egress("BFCL eval-dataset download", base_url)
     data_file = f"BFCL_v3_{category}.json"
     gt_file = f"possible_answer/BFCL_v3_{category}.json"

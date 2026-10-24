@@ -226,6 +226,20 @@ def _load_tokenizer(tokenizer_name: str):
     # vetted, not a variant the caller chose.
     tokenizer_name = repo
 
+    # Modified by Halv: load every shipped repository at its pinned commit
+    # (headroom.onnx_runtime._PINNED_REVISIONS). A shipped repository without
+    # a pin never reaches the Hub. Repositories an operator adds through
+    # HEADROOM_HF_TOKENIZER_ALLOWLIST have no pin and use the default ref.
+    from headroom.onnx_runtime import _resolve_revision, hf_pinning_enabled
+
+    revision = _resolve_revision(tokenizer_name, None)
+    if revision is None and hf_pinning_enabled() and tokenizer_name in ALLOWED_TOKENIZER_REPOS:
+        logger.warning(
+            f"Tokenizer {tokenizer_name} has no pinned revision; using estimation "
+            f"(set HEADROOM_HF_PIN=off to load the default ref)"
+        )
+        return None
+
     from headroom.offline import apply_offline_env, guard_egress, is_offline
 
     offline = is_offline()
@@ -242,6 +256,7 @@ def _load_tokenizer(tokenizer_name: str):
         # repo we are not willing to execute.
         return AutoTokenizer.from_pretrained(
             tokenizer_name,
+            revision=revision,
             trust_remote_code=False,
             local_files_only=True,
         )
@@ -275,6 +290,7 @@ def _load_tokenizer(tokenizer_name: str):
             result.append(
                 AutoTokenizer.from_pretrained(
                     tokenizer_name,
+                    revision=revision,
                     trust_remote_code=False,  # see the cache-only attempt above
                 )
             )

@@ -25,7 +25,12 @@ def main() -> int:
     try:
         from sentence_transformers import SentenceTransformer
 
-        model = SentenceTransformer(model_name, local_files_only=True)
+        from headroom.onnx_runtime import _resolve_revision
+
+        # Modified by Halv: check the pinned snapshot that runtime loads use.
+        model = SentenceTransformer(
+            model_name, local_files_only=True, revision=_resolve_revision(model_name, None)
+        )
         embedding = model.encode(["headroom cache preflight"], convert_to_numpy=True)
     except Exception as exc:
         print(
